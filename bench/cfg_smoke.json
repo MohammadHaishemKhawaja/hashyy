@@ -1,0 +1,9 @@
+[
+ {
+  "name": "smoke",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0 -c 32768 -np 1",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ }
+]

@@ -1,0 +1,20 @@
+0.00.003.668 I srv  llama_server: initializing ...
+0.00.138.974 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.139.292 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.162.030 I srv    load_model: loading model 'C:\Users\idont\Downloads\4\models\flashnext\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+0.06.118.117 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.15.958.133 I cmn          init: llama threadpool init, n_threads = 6
+0.21.979.898 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 8192, kv_unified = 'true'
+0.22.002.492 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.22.003.753 I srv  llama_server: model loaded
+0.22.003.761 I srv  llama_server: listening on http://127.0.0.1:8099
+0.23.018.036 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.23.018.727 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.36.213.175 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =     12, progress = 0.75, t =  13.19 s / 0.91 tokens per second
+1.29.867.213 I slot print_timing: id  3 | task 0 | n_gen =    100, tg =   1.99 t/s, tg_3s =   2.01 t/s
+1.33.010.482 I slot print_timing: id  3 | task 0 | n_gen =    117, tg =   2.19 t/s, tg_3s =   5.41 t/s
+1.33.633.202 I slot print_timing: id  3 | task 0 | prompt eval time =   17013.40 ms /    16 tokens ( 1063.34 ms per token,     0.94 tokens per second)
+1.33.633.214 I slot print_timing: id  3 | task 0 |        eval time =   53600.59 ms /   120 tokens (  450.43 ms per token,     2.22 tokens per second)
+1.33.633.215 I slot print_timing: id  3 | task 0 |       total time =   70613.99 ms /   136 tokens
+1.33.633.218 I slot print_timing: id  3 | task 0 |    graphs reused =        119
+1.33.633.505 I slot      release: id  3 | task 0 | stop processing: n_tokens = 135, truncated = 0

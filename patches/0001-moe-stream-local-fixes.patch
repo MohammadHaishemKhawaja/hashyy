@@ -1,0 +1,2098 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f9fb46c2a..05d5472eb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5787,6 +5787,48 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++// Page-lock a host range that is NOT read-only, for the MoE expert stream's hot-expert file.
++//
++// ggml_backend_cuda_register_host_buffer asks for cudaHostRegisterReadOnly, which this box
++// does not support (cudaDevAttrHostRegisterReadOnlySupported = 0 under Windows WDDM), so a
++// read-only GGUF mapping can never be registered. A mapping opened read-write can:
++// plain registration is supported here, and DMA out of a registered 12 GiB file mapping
++// measured 9.6-11.7 GB/s against the 12.8 GB/s link ceiling, with no CPU copy at all
++// (scratchpad/pinmap.cu). That removes two of the three passes over DRAM that every
++// page-cache hit otherwise costs: ReadFile's memcpy in, and the DMA's read back out.
++static bool ggml_backend_cuda_host_lock(void * buffer, size_t size) {
++    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterDefault);
++    if (err != cudaSuccess) {
++        (void) cudaGetLastError();
++        return false;
++    }
++    return true;
++}
++
++static void ggml_backend_cuda_host_unlock(void * buffer) {
++    (void) cudaHostUnregister(buffer);
++    (void) cudaGetLastError();
++}
++
++// Thread-private H2D upload, used by the MoE expert stream's uploader thread.
++//
++// ggml_backend_tensor_set synchronizes the stream after every copy. For the expert stream that
++// is one sync per 512-900 KiB slab, which measured 10.3 GB/s against 12.8 GB/s for the same
++// transfers with one sync per batch (scratchpad/h2d.cu), and it also stops the copy from
++// overlapping the next read. These two split the issue from the wait so the caller can batch.
++// Both use cudaStreamPerThread, so they are safe from any one thread and must be paired on
++// that same thread.
++static void ggml_backend_cuda_h2d_async(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buf->context;
++    ggml_cuda_set_device(ctx->device);
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++}
++
++static void ggml_backend_cuda_h2d_sync(void) {
++    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+@@ -5804,6 +5846,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
+         return (void *)ggml_backend_cuda_unregister_host_buffer;
+     }
++    if (strcmp(name, "ggml_backend_cuda_host_lock") == 0) {
++        return (void *)ggml_backend_cuda_host_lock;
++    }
++    if (strcmp(name, "ggml_backend_cuda_host_unlock") == 0) {
++        return (void *)ggml_backend_cuda_host_unlock;
++    }
++    if (strcmp(name, "ggml_backend_cuda_h2d_async") == 0) {
++        return (void *)ggml_backend_cuda_h2d_async;
++    }
++    if (strcmp(name, "ggml_backend_cuda_h2d_sync") == 0) {
++        return (void *)ggml_backend_cuda_h2d_sync;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6098448ae..a494ea334 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -274,7 +274,7 @@ llama_context::llama_context(
+     cparams.op_offload = params.op_offload;
+     cparams.kv_unified = params.kv_unified;
+ 
+-    if (model.moe_stream() && hparams.n_expert_used > 0) {
++    if (model.moe_stream() && hparams.n_expert_used_max() > 0) {
+         // ubatches that touch more experts than the streaming cache holds run the expert GEMMs in
+         // multiple waves, so no ubatch size restriction is needed
+         LLAMA_LOG_INFO("%s: MoE expert streaming with %u cache slots, n_ubatch = %u\n",
+@@ -2452,9 +2452,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         if (cparams.n_outputs_max_per_seq > 1) {
+             n_sampling_nodes_max = std::max(n_sampling_nodes_max, n_nodes);
+         }
++    }
++
+     if (const auto * mstream = model.moe_stream()) {
+         // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed layer
+-        const uint32_t n_eu = model.hparams.n_expert_used;
++        const uint32_t n_eu = model.hparams.n_expert_used_max();
+         uint32_t cap = mstream->n_slots > n_eu ? (mstream->n_slots - n_eu)/2 : 0;
+         cap = std::max<uint32_t>(cap, 1);
+         const uint32_t n_touch_max = std::min<uint32_t>(model.hparams.n_expert, n_tokens*n_eu);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 03dccc402..ad8e238af 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1541,7 +1541,7 @@ static bool llama_moe_stream_is_exps_name(const std::string & name) {
+ // resolve the per-layer expert cache slot count; returns 0 when streaming should not be enabled
+ // (not a MoE model, or the cache would hold every expert anyway)
+ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params, const llama_hparams & hparams, const llama_model_loader & ml) {
+-    if (hparams.n_expert == 0 || hparams.n_expert_used == 0) {
++    if (hparams.n_expert == 0 || hparams.n_expert_used_max() == 0) {
+         LLAMA_LOG_WARN("%s: MoE expert streaming requires a MoE model -- disabled\n", __func__);
+         return 0;
+     }
+@@ -1557,12 +1557,12 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
+             }
+         }
+         if (nb_expert_sum > 0) {
+-            n_slots = std::max<uint64_t>(params.moe_stream_budget/nb_expert_sum, hparams.n_expert_used);
++            n_slots = std::max<uint64_t>(params.moe_stream_budget/nb_expert_sum, hparams.n_expert_used_max());
+         }
+     }
+ 
+     if (n_slots == 0) {
+-        n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used, 16, hparams.n_expert);
++        n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used_max(), 16, hparams.n_expert);
+     }
+ 
+     if (n_slots >= hparams.n_expert) {
+@@ -2005,6 +2005,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+             if (!ml.no_alloc) {
+                 pimpl->moe_stream->open_files(ml.file_paths);
++                if (use_mmap_buffer) { // else the mappings die with the loader
++                    pimpl->moe_stream->set_mappings(ml.mappings);
++                }
+             }
+         }
+     }
+@@ -2227,7 +2230,7 @@ void llama_model::print_info() const {
+         LLAMA_LOG_INFO("%s: f_attn_value_scale    = %.4f\n",   __func__, hparams.f_attn_value_scale);
+         LLAMA_LOG_INFO("%s: n_ff                  = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_ff(il); }, hparams.n_layer_all).c_str());
+         LLAMA_LOG_INFO("%s: n_expert              = %u\n",     __func__, hparams.n_expert);
+-        LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used());
++        LLAMA_LOG_INFO("%s: n_expert_used         = %u\n",     __func__, hparams.n_expert_used_max());
+         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
+         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
+         LLAMA_LOG_INFO("%s: causal attn           = %d\n",     __func__, hparams.causal_attn);
+@@ -3525,7 +3528,7 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
+     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
+-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
++    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+     TENSOR_STREAMED       (llama_model_loader::TENSOR_STREAMED) {}
+ 
+ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index ce173960a..f131f6df4 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-moe-stream.h"
+ 
++#include <atomic>
++
+ #include "llama-impl.h"
+ 
+ #include "ggml-backend.h"
+@@ -12,13 +14,20 @@
+ 
+ #ifdef _WIN32
+ #include <malloc.h>
++#define WIN32_LEAN_AND_MEAN
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <psapi.h>
++#include <io.h>
+ #else
+ #include <fcntl.h>
+ #include <unistd.h>
+ #endif
+ 
+ static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
+-static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 18;
++static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
+ static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
+ 
+ // O_DIRECT alignment: 4096 is a multiple of any device logical block size (512/4096), so it is
+@@ -54,22 +63,74 @@ static void moe_aligned_free(void * p) {
+ #endif
+ }
+ 
++#ifdef _WIN32
++// positional read on a Windows HANDLE; see the note in llama_moe_stream_pread
++static bool llama_moe_stream_win_pread(void * handle, void * dst, size_t len, uint64_t offs) {
++    const HANDLE h = (HANDLE) handle;
++    uint8_t *    p = (uint8_t *) dst;
++    while (len > 0) {
++        OVERLAPPED ov = {};
++        ov.Offset     = (DWORD) (offs & 0xffffffffull);
++        ov.OffsetHigh = (DWORD) (offs >> 32);
++
++        DWORD       got  = 0;
++        const DWORD want = (DWORD) std::min<size_t>(len, 32u*1024*1024);
++        if (!ReadFile(h, p, want, &got, &ov) || got == 0) {
++            return false;
++        }
++        p    += got;
++        offs += got;
++        len  -= got;
++    }
++    return true;
++}
++
++// FILE_FLAG_NO_BUFFERING read: the bytes land in staging without passing through the page cache,
++// so this read neither hits nor fills the OS-page-cache L2. Offset, length and buffer must all be
++// sector-aligned, hence the head/tail padding - the caller's staging has 2*ALIGN of slack for it.
++static const uint8_t * llama_moe_stream_pread_nb(void * handle, uint8_t * staging, size_t len, size_t offs) {
++    const size_t a     = MOE_STREAM_DIRECT_ALIGN;
++    const size_t aoffs = offs & ~(a - 1);
++    const size_t head  = offs - aoffs;
++    const size_t total = ((head + len + a - 1)/a)*a;
++    if (!llama_moe_stream_win_pread(handle, staging, total, aoffs)) {
++        return nullptr;
++    }
++    return staging + head;
++}
++#endif
++
+ // read len bytes at file offset offs into staging (thread-safe positional read); staging must have
+ // room for len (+ 2*MOE_STREAM_DIRECT_ALIGN when direct). returns a pointer to the len bytes
+ // within staging, or nullptr on failure
+-static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct) {
++static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct, bool serialize = false) {
+ #ifdef _WIN32
+     GGML_UNUSED(direct);
+-    // no positional read primitive; serialize the seek+read pairs
+-    static std::mutex io_mtx;
+-    std::lock_guard<std::mutex> lock(io_mtx);
+-    try {
+-        file.seek(offs, SEEK_SET);
+-        file.read_raw(staging, len);
+-        return staging;
+-    } catch (...) {
++    // ReadFile honours the offset in OVERLAPPED even on a synchronous handle, and leaves the
++    // shared file pointer out of it, so this is a real positional read: no seek, no lock, and
++    // n_io_threads loads actually run concurrently. The seek+read pair this replaces needed a
++    // global mutex, which pinned every expert load to queue depth 1 - measured on this drive,
++    // the 490 KiB/879 KiB expert slabs run at ~1.0 GB/s at depth 1 and ~2.8 GB/s at depth 4.
++    if (serialize) {
++        static std::mutex io_mtx;
++        std::lock_guard<std::mutex> lock(io_mtx);
++        try {
++            file.seek(offs, SEEK_SET);
++            file.read_raw(staging, len);
++            return staging;
++        } catch (...) {
++            return nullptr;
++        }
++    }
++
++    const HANDLE h = (HANDLE) _get_osfhandle(file.file_id());
++    if (h == INVALID_HANDLE_VALUE) {
+         return nullptr;
+     }
++    if (!llama_moe_stream_win_pread(h, staging, len, offs)) {
++        return nullptr;
++    }
++    return staging;
+ #else
+     const int fd = file.file_id();
+ 
+@@ -145,20 +206,97 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
+ 
+     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
++
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_ADMIT")) {
++        long long lo = 0, hi = -1;
++        if (sscanf(e, "%lld:%lld", &lo, &hi) >= 1) {
++            admit_lo = lo > 0 ? (uint32_t) lo : 0;
++            admit_hi = hi > 0 ? (uint32_t) hi : UINT32_MAX;
++        }
++    }
++    // Reproduces the pre-fix behaviour - every worker through handle set 0 - so the cost of
++    // the shared synchronous file object can be A/B'd on one binary. See bench/qd.py.
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_ONE_HANDLE")) {
++        one_handle = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_ASYNC_UP")) {
++        async_upload = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_PINNED")) {
++        use_pinned_staging = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_MMAP_COPY")) {
++        use_mmap_copy = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_RANDOM_ACCESS")) {
++        use_random_access = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_TRACE")) {
++        trace = fopen(e, "wb");
++        if (trace == nullptr) {
++            LLAMA_LOG_WARN("%s: cannot open trace file %s\n", __func__, e);
++        }
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_SPLIT_WEIGHTS")) {
++        split_weights = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_L2_DIRECT")) {
++        l2_direct = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_L2_PIN")) {
++        l2_pin = atoi(e) != 0;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_SERIAL_IO")) {
++        serial_io = atoi(e) != 0;
++        if (serial_io) {
++            use_mmap_copy     = false;
++            use_random_access = false;
++        }
++    }
++    if (debug) {
++        dbg_every = 48*32;
++    }
+     use_direct_io = direct;
+ }
+ 
+ // stop and join the I/O workers before the cache buffers and files they use are destroyed
+ llama_moe_stream::~llama_moe_stream() {
++    save_heat();
++
+     {
+         std::lock_guard<std::mutex> lock(mtx);
+         shutting_down = true;
+         q_demand.clear();
+     }
+     cv_work.notify_all();
++    cv_upload.notify_all();
+     for (auto & w : workers) {
+         w.join();
+     }
++    if (uploader.joinable()) {
++        uploader.join();
++    }
++    free_staging_pool();
++
++#ifdef _WIN32
++    for (const auto * v : { &h_nobuf, &h_rand }) {
++        for (const auto & per_file : *v) {
++            for (void * h : per_file) {
++                if (h != nullptr) {
++                    CloseHandle((HANDLE) h);
++                }
++            }
++        }
++    }
++#endif
++    h_nobuf.clear();
++    h_rand.clear();
++    close_hot_file();
++
++    if (trace != nullptr) {
++        fclose(trace);
++        trace = nullptr;
++    }
+ }
+ 
+ ggml_tensor * llama_moe_stream::create_cache_tensor(
+@@ -207,9 +345,11 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         sl->slot_expert  .resize(n_slots, -1);
+         sl->slot_state   .resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
+         sl->slot_claimed .resize(n_slots, 0);
++        sl->slot_done    .resize(n_slots, 0);
+         sl->slot_gen     .resize(n_slots, 0);
+         sl->slot_last_use.resize(n_slots, 0);
+         sl->route_hotness.resize(n_expert, 0);
++        sl->route_total.resize(n_expert, 0);
+         sl->seen         .resize(n_expert, 0);
+         sl->keep         .resize(n_slots, 0);
+     }
+@@ -223,6 +363,33 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+ }
+ 
+ void llama_moe_stream::alloc_bufs(bool no_alloc) {
++    // The split issue/wait upload entry points, if this backend has them. They are looked up
++    // through the registry because the CUDA backend is a separately loaded module.
++    for (const auto & [buft, ctx_ptr] : ctxs) {
++        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++        if (dev == nullptr) {
++            continue;
++        }
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++        if (reg == nullptr) {
++            continue;
++        }
++        auto * a = (void (*)(ggml_tensor *, const void *, size_t, size_t))
++                   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_async");
++        auto * y = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_sync");
++        if (host_lock == nullptr) {
++            host_lock = (bool (*)(void *, size_t))
++                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_lock");
++            host_unlock = (void (*)(void *))
++                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unlock");
++        }
++        if (a != nullptr && y != nullptr) {
++            h2d_async = a;
++            h2d_sync  = y;
++            break;
++        }
++    }
++
+     for (auto & [buft, ctx_ptr] : ctxs) {
+         ggml_context * ctx = ctx_ptr.get();
+         if (ggml_get_first_tensor(ctx) == nullptr) {
+@@ -246,6 +413,15 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+ 
+         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
+                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
++        if (debug) {
++            fprintf(stderr, "moe stream: %s cache %.2f MiB, %u slots/layer, slab %zu KiB, io threads %d, admit %u:%u, pinned %d, randacc %d\n",
++                    ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
++                    n_slots, max_nb_expert/1024, n_io_threads, admit_lo, admit_hi,
++                    (int) use_pinned_staging, (int) use_random_access);
++            fprintf(stderr, "moe stream: async upload %s\n",
++                    (async_upload && h2d_async != nullptr) ? "on" : "off");
++            fflush(stderr);
++        }
+     }
+ }
+ 
+@@ -265,6 +441,53 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+ 
+     open_all(use_direct_io);
+ 
++#ifdef _WIN32
++    // One handle per I/O worker per file. A synchronous Windows file object serializes every
++    // ReadFile issued through it, so sharing one handle across the workers pins the drive to
++    // queue depth 1 - see the note on h_rand in the header and bench/qd.py for the measurement.
++    auto open_extra = [&](DWORD flags, std::vector<std::vector<void *>> & out, const char * what) {
++        const size_t n_sets = (size_t) (n_io_threads > 0 ? n_io_threads : 1);
++        out.assign(n_sets, std::vector<void *>(paths.size(), nullptr));
++        bool ok = true;
++        for (size_t w = 0; w < n_sets && ok; w++) {
++            for (size_t i = 0; i < paths.size(); i++) {
++                const int wlen = MultiByteToWideChar(CP_UTF8, 0, paths[i].c_str(), -1, nullptr, 0);
++                std::wstring wpath(wlen > 0 ? wlen - 1 : 0, 0);
++                if (wlen > 0) {
++                    MultiByteToWideChar(CP_UTF8, 0, paths[i].c_str(), -1, wpath.data(), wlen);
++                }
++                HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
++                        OPEN_EXISTING, flags, nullptr);
++                if (h == INVALID_HANDLE_VALUE) {
++                    LLAMA_LOG_WARN("%s: cannot open %s for %s, falling back\n", __func__, paths[i].c_str(), what);
++                    ok = false;
++                    break;
++                }
++                out[w][i] = (void *) h;
++            }
++        }
++        if (!ok) {
++            for (auto & per_file : out) {
++                for (void * p : per_file) {
++                    if (p != nullptr) {
++                        CloseHandle((HANDLE) p);
++                    }
++                }
++            }
++            out.clear();
++            return;
++        }
++        LLAMA_LOG_INFO("%s: %zu handle sets x %zu files for %s\n", __func__, out.size(), paths.size(), what);
++    };
++
++    if (admit_lo > 0 || admit_hi < UINT32_MAX) {
++        open_extra(FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, h_nobuf, "page-cache admission");
++    }
++    if (use_random_access) {
++        open_extra(FILE_FLAG_RANDOM_ACCESS, h_rand, "random-access reads");
++    }
++#endif
++
+     // fall back to buffered when O_DIRECT is unusable: either the open did not honor it (macOS,
+     // Windows, unsupported filesystems), or it opened but a probe read fails (some network/overlay
+     // filesystems accept the flag then reject aligned reads). reopening is needed because O_DIRECT
+@@ -295,6 +518,290 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+         n_streamed += sl != nullptr;
+     }
+     hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
++
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_HOT")) {
++        hot_path = e;
++        open_hot_file();
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_HEAT")) {
++        heat_path = e;
++    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_WARM_GB")) {
++        warm_extra_gb = atof(e);
++    }
++    // Drop the loader's footprint from the working set.
++    //
++    // The non-expert weights (4.21 GiB here) are read through the mmap at load, copied to VRAM
++    // and never touched again, but they stay in this process's working set as active pages, so
++    // the page cache - which is the only L2 the expert stream has - is that much smaller.
++    // EmptyWorkingSet moves them to the standby list, where they are ordinary reclaimable cache
++    // and the oldest thing on it, so expert slabs get the space instead. Pages that are still
++    // wanted come back as soft faults off standby, which cost no I/O.
++#ifdef _WIN32
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_TRIM")) {
++        if (atoi(e) == 0) {
++            goto no_trim;
++        }
++    }
++    {
++        PROCESS_MEMORY_COUNTERS before = {}, after = {};
++        before.cb = after.cb = sizeof(PROCESS_MEMORY_COUNTERS);
++        GetProcessMemoryInfo(GetCurrentProcess(), &before, sizeof(before));
++        if (EmptyWorkingSet(GetCurrentProcess())) {
++            GetProcessMemoryInfo(GetCurrentProcess(), &after, sizeof(after));
++            LLAMA_LOG_INFO("%s: working set trimmed %.2f -> %.2f GiB\n", __func__,
++                    before.WorkingSetSize/1073741824.0, after.WorkingSetSize/1073741824.0);
++        }
++    }
++no_trim:;
++#endif
++
++    if (!heat_path.empty()) {
++        heat_save_every = 256 * n_streamed; // ~256 tokens
++        warm_from_heat();
++    }
++}
++
++
++// ---------------------------------------------------------------------------
++// Heat-ranked host-RAM L2 for streamed expert slabs.
++//
++// The device cache (L1) is capped by VRAM. Without this, every L1 miss goes to
++// the GGUF file. On a consumer NVMe that is ~1.1 GB/s at expert granularity,
++// while a host->device copy runs at PCIe speed (~12 GB/s on gen3 x16), so an
++// L2 hit replaces a disk read with a copy an order of magnitude faster.
++//
++// The OS page cache is an accidental L2, but it evicts by LRU over every page
++// of the file (including the multi-GiB per-layer embedding table). This tier
++// holds expert slabs only and evicts the coldest by decaying access heat.
++//
++// Enable with LLAMA_MOE_STREAM_L2_GB=<n>. Disabled (0) by default.
++// Host-RAM L2 for streamed expert slabs, and the staging buffer at the same time.
++//
++// The tier only pays off if it adds no copy: a slab is read from the GGUF straight into its arena
++// entry, and uploaded to the device from there. An L2 hit is then one DMA out of host RAM, and an
++// L2 miss is one read plus that same DMA - exactly what the no-L2 path costs, so the arena is free
++// except for the RAM it takes from the OS page cache.
++//
++// Capacity is the whole game here, and an explicit tier can rank by route hotness where the page
++// cache only sees LRU over a 76 GiB file. Enable with LLAMA_MOE_STREAM_L2_GB=<n>, default off.
++struct moe_l2_cache {
++    struct pool {
++        size_t    slab = 0; // bytes per entry, rounded up for sector-aligned reads
++        size_t    len  = 0; // useful bytes
++        uint32_t  n    = 0;
++        uint8_t * base = nullptr;
++
++        std::vector<uint64_t> key;
++        std::vector<uint8_t>  valid; // 0 while a reservation is still being read
++        std::vector<uint8_t>  ref;   // CLOCK reference bit
++        std::vector<uint16_t> pin;   // uploads in flight, never evicted
++
++        std::unordered_map<uint64_t, uint32_t> map;
++
++        uint32_t hand = 0;
++        uint32_t used = 0;
++    };
++
++    std::mutex            mtx;
++    uint8_t *             arena       = nullptr;
++    ggml_backend_buffer_t pinned_buf  = nullptr; // non-null when the arena is pinned
++    size_t                arena_bytes = 0;
++    std::vector<pool> pools;
++    uint64_t          hits = 0, misses = 0;
++    bool              ready = false;
++
++    static size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
++
++    // pinned_buft, when given, makes the arena pinned host memory, so a hit can be uploaded
++    // with a direct DMA instead of being copied into the staging buffer first
++    void init(const std::vector<size_t> & sizes, ggml_backend_buffer_type_t pinned_buft) {
++        std::lock_guard<std::mutex> lk(mtx);
++        if (ready) {
++            return;
++        }
++        ready = true;
++
++        const char * e  = getenv("LLAMA_MOE_STREAM_L2_GB");
++        const double gb = e ? atof(e) : 0.0;
++        if (gb <= 0.0 || sizes.empty()) {
++            return;
++        }
++
++        // budget whole experts: an expert is only useful with all of its weights resident
++        size_t per_expert = 0;
++        for (size_t s : sizes) {
++            per_expert += align_up(s, MOE_STREAM_DIRECT_ALIGN);
++        }
++        if (per_expert == 0) {
++            return;
++        }
++
++        const size_t n_entries = (size_t) (gb * 1024.0*1024.0*1024.0) / per_expert;
++        if (n_entries == 0) {
++            return;
++        }
++
++        arena_bytes = n_entries * per_expert;
++        if (pinned_buft != nullptr) {
++            pinned_buf = ggml_backend_buft_alloc_buffer(pinned_buft, arena_bytes);
++            if (pinned_buf != nullptr) {
++                arena = (uint8_t *) ggml_backend_buffer_get_base(pinned_buf);
++                if (((uintptr_t) arena) % MOE_STREAM_DIRECT_ALIGN != 0) {
++                    ggml_backend_buffer_free(pinned_buf);
++                    pinned_buf = nullptr;
++                    arena      = nullptr;
++                }
++            }
++        }
++        if (arena == nullptr) {
++            // WDDM can refuse a pinning this large; a pageable arena still works, it just
++            // costs the extra copy
++            arena = (uint8_t *) moe_aligned_alloc(arena_bytes);
++        }
++        if (arena == nullptr) {
++            arena_bytes = 0;
++            return;
++        }
++
++        uint8_t * p = arena;
++        pools.resize(sizes.size());
++        for (size_t i = 0; i < sizes.size(); i++) {
++            auto & pl = pools[i];
++            pl.len  = sizes[i];
++            pl.slab = align_up(sizes[i], MOE_STREAM_DIRECT_ALIGN);
++            pl.n    = (uint32_t) n_entries;
++            pl.base = p;
++            p      += (size_t) n_entries * pl.slab;
++            pl.key  .assign(n_entries, 0);
++            pl.valid.assign(n_entries, 0);
++            pl.ref  .assign(n_entries, 0);
++            pl.pin  .assign(n_entries, 0);
++            pl.map.reserve(n_entries * 2);
++        }
++
++        LLAMA_LOG_INFO("%s: MoE L2 host cache: %.2f GiB, %zu experts\n",
++                __func__, (double) arena_bytes/(1024.0*1024.0*1024.0), n_entries);
++        fprintf(stderr, "moe stream: L2 host cache %.2f GiB, %zu experts, %zu pools, %s\n",
++                (double) arena_bytes/(1024.0*1024.0*1024.0), n_entries, pools.size(),
++                pinned_buf != nullptr ? "pinned (uploads DMA from the arena)" : "pageable");
++        fflush(stderr);
++    }
++
++    bool enabled()   const { return arena != nullptr; }
++    bool is_pinned() const { return pinned_buf != nullptr; }
++
++    pool * pool_for(size_t len) {
++        for (auto & pl : pools) {
++            if (pl.len == len) {
++                return &pl;
++            }
++        }
++        return nullptr;
++    }
++
++    // a pinned entry: the slab stays put until release(), so the caller can read into it and
++    // upload out of it with the lock dropped
++    struct ref_t {
++        uint8_t * ptr  = nullptr;
++        pool *    pl   = nullptr;
++        uint32_t  idx  = 0;
++        bool      fill = false; // true when the caller must still read the bytes in
++    };
++
++    // resident entry for key, or a reserved empty one to read into
++    ref_t acquire(uint64_t key, size_t len) {
++        ref_t r;
++        if (arena == nullptr) {
++            return r;
++        }
++        std::lock_guard<std::mutex> lk(mtx);
++        pool * pl = pool_for(len);
++        if (pl == nullptr) {
++            return r;
++        }
++
++        auto it = pl->map.find(key);
++        if (it != pl->map.end()) {
++            const uint32_t i = it->second;
++            if (!pl->valid[i]) {
++                return r; // someone else is still reading it, use the plain path
++            }
++            pl->ref[i] = 1;
++            pl->pin[i]++;
++            hits++;
++            return { pl->base + (size_t) i*pl->slab, pl, i, false };
++        }
++        misses++;
++
++        uint32_t idx;
++        if (pl->used < pl->n) {
++            idx = pl->used++;
++        } else {
++            // CLOCK: one second chance per entry, then take it
++            uint32_t guard = 0;
++            for (;; pl->hand = (pl->hand + 1) % pl->n) {
++                const uint32_t h = pl->hand;
++                if (pl->pin[h] == 0 && pl->valid[h]) {
++                    if (pl->ref[h] == 0) {
++                        idx = h;
++                        pl->hand = (h + 1) % pl->n;
++                        break;
++                    }
++                    pl->ref[h] = 0;
++                }
++                if (++guard > 4u*pl->n) {
++                    return r; // nothing evictable right now
++                }
++            }
++            pl->map.erase(pl->key[idx]);
++        }
++
++        pl->key[idx]   = key;
++        pl->valid[idx] = 0;
++        pl->ref[idx]   = 1;
++        pl->pin[idx]   = 1;
++        pl->map[key]   = idx;
++        return { pl->base + (size_t) idx*pl->slab, pl, idx, true };
++    }
++
++    // ok=false on a failed read: drop the reservation so the entry does not serve garbage
++    void release(const ref_t & r, bool ok) {
++        if (r.pl == nullptr) {
++            return;
++        }
++        std::lock_guard<std::mutex> lk(mtx);
++        if (r.fill) {
++            if (ok) {
++                r.pl->valid[r.idx] = 1;
++            } else {
++                r.pl->map.erase(r.pl->key[r.idx]);
++                r.pl->key[r.idx] = 0;
++            }
++        }
++        r.pl->pin[r.idx]--;
++    }
++
++    ~moe_l2_cache() {
++        if (arena) {
++            if (hits + misses) {
++                LLAMA_LOG_INFO("%s: MoE L2: %llu hits / %llu lookups (%.1f%%)\n", __func__,
++                        (unsigned long long) hits, (unsigned long long)(hits+misses),
++                        100.0*(double)hits/(double)(hits+misses));
++            }
++            if (pinned_buf != nullptr) {
++                ggml_backend_buffer_free(pinned_buf);
++            } else {
++                moe_aligned_free(arena);
++            }
++        }
++    }
++};
++
++static moe_l2_cache & moe_l2() { static moe_l2_cache c; return c; }
++
++static inline uint64_t moe_l2_key(uint16_t file_idx, size_t offs) {
++    return ((uint64_t) file_idx << 56) ^ (uint64_t) offs ^ 0x9e3779b97f4a7c15ull;
+ }
+ 
+ // spawn the I/O thread pool on first use (from the remap callback, under mtx)
+@@ -303,18 +810,307 @@ void llama_moe_stream::start_workers_locked() {
+         return;
+     }
+     workers_started = true;
++    if (async_upload && init_staging_pool()) {
++        uploader = std::thread([this]() { uploader_loop(); });
++    } else {
++        free_staging_pool();
++    }
+     workers.reserve(n_io_threads);
+     for (int32_t i = 0; i < n_io_threads; i++) {
+-        workers.emplace_back([this]() { worker_loop(); });
++        workers.emplace_back([this, i]() { worker_loop(i); });
+     }
+ }
+ 
+ // I/O worker: pops a reserved load, reads its expert slab(s) from the GGUF file into the cache
+ // slot, and marks the slot RESIDENT (or flags load_failed); stale/duplicate items are skipped
+-void llama_moe_stream::worker_loop() {
++bool llama_moe_stream::init_staging_pool() {
++    if (h2d_async == nullptr || h2d_sync == nullptr) {
++        return false;
++    }
++    auto * host_buft = pinned_buft();
++    if (host_buft == nullptr) {
++        return false;
++    }
++    // Enough slabs that every worker can hold one while the uploader still has a queue to
++    // drain; too few and the workers block on the pool instead of reading ahead.
++    n_staging      = std::max(16, 3*std::max(1, n_io_threads));
++    staging_stride = (max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN + 4095) & ~(size_t) 4095;
++    staging_buf    = ggml_backend_buft_alloc_buffer(host_buft, staging_stride*(size_t) n_staging);
++    if (staging_buf == nullptr) {
++        n_staging = 0;
++        return false;
++    }
++    staging_base = (uint8_t *) ggml_backend_buffer_get_base(staging_buf);
++    if (((uintptr_t) staging_base) % MOE_STREAM_DIRECT_ALIGN != 0) {
++        ggml_backend_buffer_free(staging_buf);
++        staging_buf  = nullptr;
++        staging_base = nullptr;
++        n_staging    = 0;
++        return false;
++    }
++    staging_free.resize(n_staging);
++    for (int32_t i = 0; i < n_staging; i++) {
++        staging_free[i] = i;
++    }
++    return true;
++}
++
++void llama_moe_stream::free_staging_pool() {
++    if (staging_buf != nullptr) {
++        ggml_backend_buffer_free(staging_buf);
++        staging_buf = nullptr;
++    }
++    staging_base = nullptr;
++    staging_free.clear();
++    n_staging = 0;
++}
++
++// Drains the upload queue onto this thread's CUDA stream and synchronizes once per drain,
++// then commits the slots. One sync per batch instead of one per slab is the difference
++// between 10.3 and 12.8 GB/s on this link, and because the copies no longer sit in the
++// middle of a worker's read loop they overlap the other workers' reads.
++void llama_moe_stream::uploader_loop() {
++    std::vector<llama_moe_stream_upload> batch;
++    std::unique_lock<std::mutex> lk(mtx);
++    while (true) {
++        cv_upload.wait(lk, [&]{ return shutting_down || !q_upload.empty(); });
++        if (shutting_down && q_upload.empty()) {
++            break;
++        }
++        batch.clear();
++        batch.reserve(q_upload.size());
++        while (!q_upload.empty()) {
++            batch.push_back(q_upload.front());
++            q_upload.pop_front();
++        }
++        lk.unlock();
++
++        const int64_t t0 = ggml_time_us();
++        for (const auto & u : batch) {
++            const auto & wt = u.sl->weights[u.widx];
++            const void * src = u.src != nullptr ? (const void *) u.src
++                                                : (const void *) (staging_base + (size_t) u.buf*staging_stride);
++            h2d_async(wt.cache, src, (size_t) u.slot*wt.nb_expert, wt.nb_expert);
++        }
++        h2d_sync();
++        const int64_t dt = ggml_time_us() - t0;
++
++        lk.lock();
++        stats.t_upload_us += dt;
++        for (const auto & u : batch) {
++            auto & sl = *u.sl;
++            const uint32_t bit = 1u << u.widx;
++            if (u.buf >= 0) {
++                staging_free.push_back(u.buf);
++            }
++            sl.slot_claimed[u.slot] &= ~bit;
++            // a reservation can have been superseded while the copy was in flight; the slab
++            // still landed in the right slot, but the slot no longer holds that expert
++            if (u.gen != sl.slot_gen[u.slot]) {
++                continue;
++            }
++            sl.slot_done[u.slot] |= bit;
++            if (sl.slot_done[u.slot] == sl.weights_mask()) {
++                sl.slot_state[u.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++            }
++        }
++        cv_done.notify_all();
++        cv_upload.notify_all(); // workers may be waiting on a staging slab
++    }
++}
++
++
++// ---- page-locked hot-expert file -------------------------------------------------------
++
++const uint8_t * llama_moe_stream::hot_lookup(uint16_t file_idx, size_t src_offs, size_t nb) const {
++    if (hot_base == nullptr) {
++        return nullptr;
++    }
++    const auto it = hot_index.find(((uint64_t) file_idx << 48) | (uint64_t) src_offs);
++    if (it == hot_index.end() || it->second + nb > hot_size) {
++        return nullptr;
++    }
++    return (const uint8_t *) hot_base + it->second;
++}
++
++void llama_moe_stream::open_hot_file() {
++    if (hot_path.empty()) {
++        return;
++    }
++#ifdef _WIN32
++    if (host_lock == nullptr) {
++        LLAMA_LOG_WARN("%s: backend cannot page-lock host memory, hot file disabled\n", __func__);
++        return;
++    }
++    const std::string ipath = hot_path + ".idx";
++    FILE * ix = fopen(ipath.c_str(), "r");
++    if (ix == nullptr) {
++        LLAMA_LOG_WARN("%s: no index at %s, hot file disabled\n", __func__, ipath.c_str());
++        return;
++    }
++    char magic[16] = {};
++    int  ver = 0;
++    long long n_slabs = 0;
++    if (fscanf(ix, "%15s %d %lld", magic, &ver, &n_slabs) != 3 ||
++            strcmp(magic, "moe_hot") != 0 || ver != 2) {
++        LLAMA_LOG_WARN("%s: %s is not a v2 hot index\n", __func__, ipath.c_str());
++        fclose(ix);
++        return;
++    }
++    hot_index.reserve((size_t) n_slabs*2);
++    for (long long k = 0; k < n_slabs; k++) {
++        long long fi = 0, src = 0, nb = 0, ho = 0;
++        if (fscanf(ix, " %lld %lld %lld %lld", &fi, &src, &nb, &ho) != 4) {
++            break;
++        }
++        hot_index[((uint64_t) (uint16_t) fi << 48) | (uint64_t) src] = (size_t) ho;
++    }
++    fclose(ix);
++
++    // READ-WRITE on purpose: a read-only mapping cannot be page-locked on this platform.
++    // Nothing ever writes through it.
++    HANDLE fh = CreateFileA(hot_path.c_str(), GENERIC_READ | GENERIC_WRITE,
++            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (fh == INVALID_HANDLE_VALUE) {
++        LLAMA_LOG_WARN("%s: cannot open %s read-write (%lu), hot file disabled\n",
++                __func__, hot_path.c_str(), GetLastError());
++        hot_index.clear();
++        return;
++    }
++    LARGE_INTEGER sz = {};
++    GetFileSizeEx(fh, &sz);
++    HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READWRITE, 0, 0, nullptr);
++    if (mh == nullptr) {
++        CloseHandle(fh);
++        LLAMA_LOG_WARN("%s: CreateFileMapping failed (%lu), hot file disabled\n", __func__, GetLastError());
++        hot_index.clear();
++        return;
++    }
++    void * base = MapViewOfFile(mh, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
++    if (base == nullptr) {
++        CloseHandle(mh);
++        CloseHandle(fh);
++        LLAMA_LOG_WARN("%s: MapViewOfFile failed (%lu), hot file disabled\n", __func__, GetLastError());
++        hot_index.clear();
++        return;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    // page it in before locking, in parallel - the lock itself will not do the I/O for us
++    {
++        const size_t total = (size_t) sz.QuadPart;
++        const int32_t nthr = std::max(1, n_io_threads);
++        std::atomic<size_t> next{0};
++        const size_t CHUNK = 64ull << 20;
++        std::vector<std::thread> ts;
++        std::atomic<uint64_t> sink{0};
++        for (int32_t t = 0; t < nthr; t++) {
++            ts.emplace_back([&]() {
++                uint64_t acc = 0;
++                for (;;) {
++                    const size_t o = next.fetch_add(CHUNK);
++                    if (o >= total) {
++                        break;
++                    }
++                    const size_t end = std::min(total, o + CHUNK);
++                    for (size_t q = o; q < end; q += 4096) {
++                        acc += ((const volatile uint8_t *) base)[q];
++                    }
++                }
++                sink += acc;
++            });
++        }
++        for (auto & th : ts) {
++            th.join();
++        }
++    }
++    const double t_touch = (ggml_time_us() - t0)/1e6;
++
++    const int64_t t1 = ggml_time_us();
++    if (!host_lock(base, (size_t) sz.QuadPart)) {
++        UnmapViewOfFile(base);
++        CloseHandle(mh);
++        CloseHandle(fh);
++        LLAMA_LOG_WARN("%s: could not page-lock %.2f GiB, hot file disabled\n",
++                __func__, sz.QuadPart/1073741824.0);
++        hot_index.clear();
++        return;
++    }
++    hot_base   = base;
++    hot_size   = (size_t) sz.QuadPart;
++    hot_file   = fh;
++    hot_map    = mh;
++    hot_locked = true;
++    LLAMA_LOG_INFO("%s: hot expert file %.2f GiB, %zu experts, paged in %.1fs, locked in %.1fs\n",
++            __func__, hot_size/1073741824.0, hot_index.size(), t_touch, (ggml_time_us() - t1)/1e6);
++#else
++    LLAMA_LOG_WARN("%s: hot expert file is Windows-only for now\n", __func__);
++#endif
++}
++
++void llama_moe_stream::close_hot_file() {
++#ifdef _WIN32
++    if (hot_locked && host_unlock != nullptr && hot_base != nullptr) {
++        host_unlock(hot_base);
++    }
++    if (hot_base != nullptr) {
++        UnmapViewOfFile(hot_base);
++    }
++    if (hot_map != nullptr) {
++        CloseHandle((HANDLE) hot_map);
++    }
++    if (hot_file != nullptr) {
++        CloseHandle((HANDLE) hot_file);
++    }
++#endif
++    hot_base = nullptr;
++    hot_map  = nullptr;
++    hot_file = nullptr;
++    hot_locked = false;
++    hot_index.clear();
++}
++
++void llama_moe_stream::worker_loop(int32_t wid) {
++#ifdef _WIN32
++    // These threads are almost always blocked on I/O; what matters is how fast they are
++    // scheduled once a read completes. They share 6 cores with the ggml compute threads,
++    // and every layer waits on the slowest of them.
++    {
++        const char * e = std::getenv("LLAMA_MOE_STREAM_PRIO");
++        if (e == nullptr || atoi(e) != 0) {
++            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++        }
++    }
++#endif
+     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
+     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
+-    uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
++    moe_l2().init(slab_sizes(), l2_pin ? pinned_buft() : nullptr);
++
++    // ggml_backend_tensor_set from plain host memory makes CUDA stage the copy through its own
++    // pinned buffer, which about halves the achieved PCIe rate; take the staging from the device
++    // host buffer type instead so the upload is a direct DMA
++    const size_t staging_size = max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN;
++
++    ggml_backend_buffer_t staging_buf = nullptr;
++    uint8_t *             staging     = nullptr;
++    if (use_pinned_staging) {
++        if (auto * host_buft = pinned_buft()) {
++            staging_buf = ggml_backend_buft_alloc_buffer(host_buft, staging_size);
++            if (staging_buf != nullptr) {
++                staging = (uint8_t *) ggml_backend_buffer_get_base(staging_buf);
++                if (((uintptr_t) staging) % MOE_STREAM_DIRECT_ALIGN != 0) {
++                    staging = nullptr; // unbuffered reads need a sector-aligned destination
++                }
++            }
++        }
++    }
++    if (staging == nullptr) {
++        if (staging_buf != nullptr) {
++            ggml_backend_buffer_free(staging_buf);
++            staging_buf = nullptr;
++        }
++        staging = (uint8_t *) moe_aligned_alloc(staging_size);
++    }
+     GGML_ASSERT(staging != nullptr);
+ 
+     std::unique_lock<std::mutex> lk(mtx);
+@@ -327,40 +1123,430 @@ void llama_moe_stream::worker_loop() {
+         llama_moe_stream_work w = q_demand.front();
+         q_demand.pop_front();
+ 
+-        auto & sl = *w.sl;
++        auto & sl   = *w.sl;
++        // widx < 0 means this one item carries every weight of the expert
++        const int32_t  w0  = w.widx < 0 ? 0 : w.widx;
++        const int32_t  w1  = w.widx < 0 ? (int32_t) sl.weights.size() : w.widx + 1;
++        const uint32_t bit = w.widx < 0 ? sl.weights_mask() : 1u << w.widx;
+         if (w.gen != sl.slot_gen[w.slot] ||
+             sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
+             sl.slot_expert[w.slot] != w.expert ||
+-            sl.slot_claimed[w.slot]) {
+-            continue; // stale or duplicate item
++            (sl.slot_claimed[w.slot] & bit) != 0 ||
++            (sl.slot_done[w.slot] & bit) != 0) {
++            continue; // stale, already loaded, or owned by another worker
+         }
+-        sl.slot_claimed[w.slot] = 1;
++        sl.slot_claimed[w.slot] |= bit;
+ 
+         lk.unlock();
+ 
+-        bool ok = true;
+-        for (const auto & wt : sl.weights) {
+-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+-            if (data == nullptr) {
+-                ok = false;
+-                break;
++        const bool use_uploader = h2d_async != nullptr && staging_base != nullptr;
++        uint32_t issued = 0; // weights handed to the uploader; it commits those
++        bool    ok      = true;
++        int     n_buf   = 0, n_nobuf = 0;
++        int     n_f = 0, n_m = 0, n_s = 0;
++        int64_t us_read = 0, us_up   = 0;
++        for (int32_t wi = w0; wi < w1 && ok; wi++) {
++            const auto & wt = sl.weights[wi];
++            const int64_t  t_r0  = ggml_time_us();
++            const size_t   eoffs = wt.offs + (size_t) w.expert*wt.nb_expert;
++            const uint64_t l2key = moe_l2_key(wt.file_idx, eoffs);
++            const uint8_t * data = nullptr;
++
++            // the arena entry doubles as the staging buffer, so an L2 hit costs one DMA and an
++            // L2 miss costs one read plus that DMA - neither pays for an extra copy. the mapped
++            // upload never fills an entry, so the two are exclusive.
++            const bool use_map = !map_addr.empty() && map_addr[wt.file_idx] != nullptr;
++
++            moe_l2_cache::ref_t l2r = use_map ? moe_l2_cache::ref_t{} : moe_l2().acquire(l2key, wt.nb_expert);
++
++            // The arena is too large to stay fully resident, so a DMA straight out of it can fault
++            // inside the CUDA copy. Keep the upload on the pinned staging buffer and pay one
++            // memcpy either way: out of the arena on a hit, into it on a fill.
++            const bool l2_dma = l2r.ptr != nullptr && (l2_direct || moe_l2().is_pinned());
++
++            // With the uploader running, read into a slab of the shared pinned pool instead of
++            // this worker's own staging buffer: ownership passes to the uploader, so the worker
++            // is free to start the next read immediately.
++            const uint8_t * hot = hot_lookup(wt.file_idx, eoffs, wt.nb_expert);
++            int32_t   pool_buf = -1;
++            uint8_t * slab     = staging;
++            if (use_uploader && hot == nullptr && !use_map && l2r.ptr == nullptr) {
++                std::unique_lock<std::mutex> lg(mtx);
++                cv_upload.wait(lg, [&]{ return shutting_down || !staging_free.empty(); });
++                if (!shutting_down) {
++                    pool_buf = staging_free.back();
++                    staging_free.pop_back();
++                    slab = staging_base + (size_t) pool_buf*staging_stride;
++                }
++            }
++            uint8_t * dst = l2_dma ? l2r.ptr : slab;
++
++            if (hot != nullptr) {
++                // locked, already resident, and registered with CUDA: hand the pointer
++                // straight to the copy. No read, no staging memcpy, one pass over DRAM.
++                data = hot;
++            } else if (use_map) {
++                data = map_addr[wt.file_idx] + eoffs;
++            } else if (l2r.ptr != nullptr && !l2r.fill) {
++                if (l2_dma) {
++                    data = l2r.ptr;
++                } else {
++                    memcpy(slab, l2r.ptr, wt.nb_expert);
++                    data = slab;
++                }
++            } else {
++                const bool in_band = w.heat >= admit_lo && w.heat <= admit_hi;
++#ifdef _WIN32
++                // unbuffered needs head/tail slack that an arena entry does not have
++                void * h_nb = in_band || h_nobuf.empty() || dst != slab
++                    ? nullptr : h_nobuf[one_handle ? 0 : wid][wt.file_idx];
++                if (h_nb != nullptr) {
++                    data = llama_moe_stream_pread_nb(h_nb, slab, wt.nb_expert, eoffs);
++                    n_nobuf++;
++                } else if (!h_rand.empty() && !serial_io) {
++                    data = llama_moe_stream_win_pread(h_rand[one_handle ? 0 : wid][wt.file_idx], dst, wt.nb_expert, eoffs) ? dst : nullptr;
++                    n_buf++;
++                } else {
++                    data = llama_moe_stream_pread(*files[wt.file_idx], dst, wt.nb_expert, eoffs, use_direct_io, serial_io);
++                    n_buf++;
++                }
++#else
++                GGML_UNUSED(in_band);
++                data = llama_moe_stream_pread(*files[wt.file_idx], dst, wt.nb_expert, eoffs, use_direct_io, serial_io);
++                n_buf++;
++#endif
++            }
++            const int64_t t_r1 = ggml_time_us();
++            const int64_t dt   = t_r1 - t_r0;
++            us_read += dt;
++            if (dt < 150) {
++                n_f++;
++            } else if (dt < 600) {
++                n_m++;
++            } else {
++                n_s++;
++            }
++            if (data != nullptr && l2r.fill && !l2_dma) {
++                memcpy(l2r.ptr, data, wt.nb_expert); // populate the tier from what we just read
+             }
+-            ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
++            if (data != nullptr) {
++                if (hot != nullptr && use_uploader) {
++                    // the hot file is page-locked and never written, so the uploader can DMA
++                    // from it whenever it gets to it - no staging slab is tied up meanwhile
++                    std::lock_guard<std::mutex> lg(mtx);
++                    q_upload.push_back({ &sl, w.slot, wi, w.gen, -1, hot });
++                    issued |= 1u << wi;
++                    cv_upload.notify_one();
++                } else if (pool_buf >= 0) {
++                    // hand the slab to the uploader and move on to the next read; the copy
++                    // crosses PCIe while this worker is already reading the next slab
++                    std::lock_guard<std::mutex> lg(mtx);
++                    q_upload.push_back({ &sl, w.slot, wi, w.gen, pool_buf, nullptr });
++                    issued |= 1u << wi;
++                    pool_buf = -1;
++                    cv_upload.notify_one();
++                } else {
++                    ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
++                }
++            }
++            if (pool_buf >= 0) {
++                std::lock_guard<std::mutex> lg(mtx);
++                staging_free.push_back(pool_buf); // read failed, give the slab back
++                pool_buf = -1;
++                cv_upload.notify_all();
++            }
++            moe_l2().release(l2r, data != nullptr);
++            us_up += ggml_time_us() - t_r1;
++            ok = data != nullptr;
+         }
+ 
+         lk.lock();
+ 
+-        sl.slot_claimed[w.slot] = 0;
++        stats.n_fast       += n_f;
++        stats.n_med        += n_m;
++        stats.n_slow       += n_s;
++        stats.n_buffered   += n_buf;
++        stats.n_unbuffered += n_nobuf;
++        stats.t_read_us    += us_read;
++        stats.t_upload_us  += us_up;
++
++        // weights handed to the uploader stay claimed until it has synchronized the copy
++        sl.slot_claimed[w.slot] &= ~(bit & ~issued);
+         if (!ok) {
+             load_failed = true;
++            cv_done.notify_all();
+         } else {
+-            sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++            sl.slot_done[w.slot] |= bit & ~issued;
++            // the remap only ever waits on RESIDENT, so a part-loaded slot is nothing to wake for
++            if (sl.slot_done[w.slot] == sl.weights_mask()) {
++                sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++                cv_done.notify_all();
++            }
+         }
+-        cv_done.notify_all();
+     }
+     lk.unlock();
+ 
+-    moe_aligned_free(staging);
++    if (staging_buf != nullptr) {
++        ggml_backend_buffer_free(staging_buf);
++    } else {
++        moe_aligned_free(staging);
++    }
++}
++
++// Ranked expert ids per layer. Text so it can be inspected and hand-edited; it is tiny
++// (a few hundred KiB) and written once at shutdown.
++void llama_moe_stream::save_heat() const {
++    if (heat_path.empty()) {
++        return;
++    }
++    // write-then-rename: a kill partway through a save must not leave a truncated ranking
++    const std::string tmp = heat_path + ".tmp";
++    FILE * f = fopen(tmp.c_str(), "w");
++    if (f == nullptr) {
++        LLAMA_LOG_WARN("%s: cannot write expert heat to %s\n", __func__, tmp.c_str());
++        return;
++    }
++    fprintf(f, "moe_heat 2\n");
++
++    std::vector<int32_t> order;
++    for (size_t il = 0; il < layers.size(); il++) {
++        const auto & sl = layers[il];
++        if (!sl) {
++            continue;
++        }
++        order.resize(sl->n_expert);
++        for (uint32_t e = 0; e < sl->n_expert; e++) {
++            order[e] = (int32_t) e;
++        }
++        // ranked by the undecayed count: the warm order should be "most used", not "most
++        // recently used", and the decayed value drops rare-but-real experts to 0, which is
++        // what capped how deep a page-cache warm could go.
++        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
++            if (sl->route_total[a] != sl->route_total[b]) {
++                return sl->route_total[a] > sl->route_total[b];
++            }
++            return sl->route_hotness[a] > sl->route_hotness[b];
++        });
++
++        size_t n = 0;
++        while (n < order.size() && sl->route_total[order[n]] > 0) {
++            n++;
++        }
++        fprintf(f, "L %zu %zu\n", il, n);
++        for (size_t i = 0; i < n; i++) {
++            fprintf(f, "%d %u %u\n", order[i], sl->route_hotness[order[i]], sl->route_total[order[i]]);
++        }
++    }
++    fclose(f);
++
++    std::remove(heat_path.c_str()); // rename does not replace on Windows
++    if (std::rename(tmp.c_str(), heat_path.c_str()) != 0) {
++        LLAMA_LOG_WARN("%s: cannot move %s into place\n", __func__, tmp.c_str());
++        return;
++    }
++    if (debug) {
++        fprintf(stderr, "moe stream: wrote expert heat to %s\n", heat_path.c_str());
++        fflush(stderr);
++    }
++}
++
++// Fill every device slot with the hottest experts from a previous run, then optionally read
++// further down the ranking so those slabs land in the OS page cache too.
++void llama_moe_stream::warm_from_heat() {
++    FILE * f = fopen(heat_path.c_str(), "r");
++    if (f == nullptr) {
++        if (debug) {
++            fprintf(stderr, "moe stream: no heat file at %s, starting cold\n", heat_path.c_str());
++            fflush(stderr);
++        }
++        return;
++    }
++
++    char magic[32] = {};
++    int  version   = 0;
++    if (fscanf(f, "%31s %d", magic, &version) != 2 || strcmp(magic, "moe_heat") != 0 ||
++            (version != 1 && version != 2)) {
++        LLAMA_LOG_WARN("%s: %s is not a v1/v2 heat file\n", __func__, heat_path.c_str());
++        fclose(f);
++        return;
++    }
++
++    struct heat_entry { int32_t e; uint32_t h; uint32_t tot; };
++    std::vector<std::vector<heat_entry>> ranked(layers.size());
++    size_t il = 0, n = 0;
++    while (fscanf(f, " L %zu %zu", &il, &n) == 2) {
++        if (il >= layers.size()) {
++            break;
++        }
++        ranked[il].reserve(n);
++        for (size_t i = 0; i < n; i++) {
++            int32_t  e = -1;
++            uint32_t h = 0, tot = 0;
++            if (fscanf(f, " %d %u", &e, &h) != 2) {
++                break;
++            }
++            if (version >= 2 && fscanf(f, " %u", &tot) != 1) {
++                break;
++            }
++            // seed eviction with something non-zero even where the decayed heat aged
++            // out, or the warm set is evicted again within ~30 tokens
++            if (h == 0 && tot > 0) {
++                h = 1;
++            }
++            if (e >= 0) {
++                ranked[il].push_back({ e, h, tot > 0 ? tot : h });
++            }
++        }
++    }
++    fclose(f);
++
++    const int64_t t0 = ggml_time_us();
++    size_t n_slots_filled = 0;
++    {
++        std::unique_lock<std::mutex> lk(mtx);
++        start_workers_locked();
++        for (size_t i = 0; i < layers.size(); i++) {
++            auto & sl = layers[i];
++            if (!sl || ranked[i].empty()) {
++                continue;
++            }
++            // eviction ranks by route_hotness first, so a cache warmed without it would be
++            // thrown away by the first few misses
++            for (const auto & r : ranked[i]) {
++                if ((uint32_t) r.e < sl->n_expert) {
++                    sl->route_hotness[r.e] = r.h;
++                    // also the undecayed count, so the page-cache admission band treats a
++                    // warmed expert as known rather than as a first-ever touch
++                    sl->route_total[r.e] = r.tot;
++                }
++            }
++
++            const size_t want = std::min<size_t>(ranked[i].size(), sl->n_slots);
++            for (size_t k = want; k-- > 0; ) {
++                const int32_t e = ranked[i][k].e;
++                if ((uint32_t) e >= sl->n_expert || sl->expert_slot.count(e)) {
++                    continue;
++                }
++                const int32_t slot = (int32_t) k;
++                reserve_slot_locked(*sl, e, slot);
++                enqueue_weights_locked(*sl, e, slot);
++                n_slots_filled++;
++            }
++        }
++        // the graph has not run yet, so nothing can be evicted out from under us
++        cv_done.wait(lk, [&]{
++            if (load_failed) {
++                return true;
++            }
++            for (const auto & sl : layers) {
++                if (!sl) {
++                    continue;
++                }
++                for (uint32_t s = 0; s < sl->n_slots; s++) {
++                    if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++                        return false;
++                    }
++                }
++            }
++            return true;
++        });
++    }
++
++    // Beyond the device cache, read further down each ranking with ordinary buffered reads so
++    // the slabs end up on the standby list. This is what the demand misses would otherwise
++    // spend hundreds of tokens doing.
++    // Warming is itself an I/O job, so it uses the same per-worker handles as the loader:
++    // on one shared handle this loop ran at ~1 GB/s and a 16 GiB warm was unaffordable.
++    std::atomic<size_t> warmed_a{0};
++    const size_t budget = (size_t) (warm_extra_gb * 1024.0*1024.0*1024.0);
++    if (budget > 0) {
++        struct warm_item { uint16_t file_idx; size_t offs; size_t len; };
++        std::vector<warm_item> items;
++        size_t planned = 0;
++        for (size_t k = 0; planned < budget; k++) {
++            bool any = false;
++            for (size_t i2 = 0; i2 < layers.size() && planned < budget; i2++) {
++                auto & sl = layers[i2];
++                if (!sl) {
++                    continue;
++                }
++                const size_t idx = sl->n_slots + k;
++                if (idx >= ranked[i2].size()) {
++                    continue;
++                }
++                any = true;
++                const int32_t e = ranked[i2][idx].e;
++                for (const auto & wt : sl->weights) {
++                    items.push_back({ wt.file_idx, wt.offs + (size_t) e*wt.nb_expert, wt.nb_expert });
++                    planned += wt.nb_expert;
++                }
++            }
++            if (!any) {
++                break;
++            }
++        }
++
++        // Warm coldest-first. The page cache holds less than the full ranking, so reading
++        // hottest-first means the hottest slabs are the ones the rest of the warm evicts -
++        // the warm would end up holding exactly the wrong half of what it read.
++        std::reverse(items.begin(), items.end());
++
++        const int32_t nthr = std::max(1, n_io_threads);
++        std::atomic<size_t> next{0};
++        std::vector<std::thread> ts;
++        for (int32_t t = 0; t < nthr; t++) {
++            ts.emplace_back([&, t]() {
++                uint8_t * buf = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
++                if (buf == nullptr) {
++                    return;
++                }
++                for (;;) {
++                    const size_t k = next.fetch_add(1);
++                    if (k >= items.size()) {
++                        break;
++                    }
++                    const auto & it = items[k];
++                    bool ok = false;
++#ifdef _WIN32
++                    if (!h_rand.empty()) {
++                        ok = llama_moe_stream_win_pread(h_rand[t % (int32_t) h_rand.size()][it.file_idx],
++                                                        buf, it.len, it.offs);
++                    } else
++#endif
++                    {
++                        ok = llama_moe_stream_pread(*files[it.file_idx], buf, it.len, it.offs, false) != nullptr;
++                    }
++                    if (ok) {
++                        warmed_a.fetch_add(it.len, std::memory_order_relaxed);
++                    }
++                }
++                moe_aligned_free(buf);
++            });
++        }
++        for (auto & th : ts) {
++            th.join();
++        }
++    }
++    const size_t warmed = warmed_a.load();
++
++    if (debug) {
++        fprintf(stderr, "moe stream: warmed %zu device slots + %.2f GiB into the page cache in %.1f s\n",
++                n_slots_filled, (double) warmed/(1024.0*1024.0*1024.0),
++                (ggml_time_us() - t0)/1e6);
++        fflush(stderr);
++    }
++}
++
++// one queue item per weight of the expert, so they load concurrently
++void llama_moe_stream::enqueue_weights_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
++    const int32_t n = split_weights ? (int32_t) sl.weights.size() : 1;
++    for (int32_t i = 0; i < n; i++) {
++        // the admission band keys on the UNDECAYED count: a warmed expert whose decayed
++        // hotness has aged out is still in the page cache, and reading it unbuffered would
++        // go to disk for bytes that are already in RAM
++        q_demand.push_back({ &sl, expert, slot, split_weights ? i : -1, sl.slot_gen[slot], sl.route_total[expert] });
++        cv_work.notify_one();
++    }
+ }
+ 
+ // least valuable evictable slot: empty first, then coldest resident (min route hotness, oldest use
+@@ -399,14 +1585,150 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+         sl.expert_slot.erase(sl.slot_expert[slot]);
+     }
+ 
+-    sl.slot_expert[slot] = expert;
+-    sl.slot_state[slot]  = LLAMA_MOE_STREAM_SLOT_LOADING;
++    sl.slot_expert[slot]  = expert;
++    sl.slot_state[slot]   = LLAMA_MOE_STREAM_SLOT_LOADING;
++    sl.slot_done[slot]    = 0;
++    sl.slot_claimed[slot] = 0;
+     sl.slot_gen[slot]++;
+     sl.slot_last_use[slot] = ++sl.use_counter;
+     sl.expert_slot[expert] = slot;
+     sl.seen[expert] = 1;
+ }
+ 
++// windowed counters since the last line, so a warming run and a steady-state run are told apart
++void llama_moe_stream::print_stats_delta() {
++    const int64_t calls = stats.n_calls - dbg_last_call;
++    if (dbg_every <= 0 || calls < dbg_every) {
++        return;
++    }
++    dbg_last_call = stats.n_calls;
++
++    const int64_t hit   = stats.n_hit       - dbg_prev.hit;
++    const int64_t miss  = stats.n_miss      - dbg_prev.miss;
++    const int64_t cold  = stats.n_miss_cold - dbg_prev.cold;
++    const int64_t stall = stats.t_stall_us  - dbg_prev.stall;
++    const int64_t nobuf = stats.n_unbuffered- dbg_prev.nobuf;
++    GGML_UNUSED(nobuf);
++    const int64_t rd    = stats.t_read_us   - dbg_prev.read;
++    const int64_t up    = stats.t_upload_us - dbg_prev.up;
++    const int64_t fast  = stats.n_fast      - dbg_prev.fast;
++    const int64_t med   = stats.n_med       - dbg_prev.med;
++    const int64_t slow  = stats.n_slow      - dbg_prev.slow;
++    const int64_t rmp   = stats.t_remap_us  - dbg_prev.remap;
++    dbg_prev = { stats.n_hit, stats.n_miss, stats.n_miss_cold, stats.t_stall_us,
++                 stats.n_buffered, stats.n_unbuffered, stats.t_read_us, stats.t_upload_us,
++                 stats.n_fast, stats.n_med, stats.n_slow, stats.t_remap_us };
++
++    const int64_t tok = calls/(int64_t) std::max<size_t>(1, std::count_if(layers.begin(), layers.end(),
++                [](const std::unique_ptr<llama_moe_stream_layer> & l) { return l != nullptr; }));
++
++    // the library log callback does not reach llama-server's log file, so write to stderr
++    fprintf(stderr, "moe stream: %4" PRId64 " tok | L1 hit %5.1f%% | miss %5.1f/tok (%4" PRId64 " cold)"
++                    " | remap %6.1f | stall %6.1f | read %6.1f | up %6.1f ms/tok | src %5.1f/%5.1f/%5.1f f/m/s\n",
++            tok, 100.0*(double) hit/(double) std::max<int64_t>(1, hit+miss),
++            (double) miss/(double) std::max<int64_t>(1, tok), cold,
++            rmp   /1000.0/(double) std::max<int64_t>(1, tok),
++            stall /1000.0/(double) std::max<int64_t>(1, tok),
++            rd    /1000.0/(double) std::max<int64_t>(1, tok),
++            up    /1000.0/(double) std::max<int64_t>(1, tok),
++            (double) fast/(double) std::max<int64_t>(1, tok),
++            (double) med /(double) std::max<int64_t>(1, tok),
++            (double) slow/(double) std::max<int64_t>(1, tok));
++    if (moe_l2().arena != nullptr) {
++        const uint64_t h2 = moe_l2().hits, m2 = moe_l2().misses;
++        fprintf(stderr, "moe stream: L2 hit %5.1f%% (%llu / %llu lifetime)\n",
++                100.0*(double) h2/(double) std::max<uint64_t>(1, h2+m2),
++                (unsigned long long) h2, (unsigned long long)(h2+m2));
++    }
++    fflush(stderr);
++}
++
++// A streamed slab can be uploaded straight from the mapped file, which skips the kernel copy a
++// buffered read makes into staging. The offsets come from the loader, so compare one slab read
++// both ways before trusting them - a wrong mapping would quietly upload wrong weights.
++void llama_moe_stream::set_mappings(const llama_mmaps & mappings) {
++#ifndef _WIN32
++    // only Windows keeps the whole view mapped; elsewhere the loader really unmaps the fragments
++    // it did not load, and the streamed experts are among them
++    GGML_UNUSED(mappings);
++    return;
++#else
++    if (!use_mmap_copy || mappings.empty() || use_direct_io) {
++        return;
++    }
++
++    map_addr.assign(files.size(), nullptr);
++    map_size.assign(files.size(), 0);
++    for (size_t i = 0; i < files.size() && i < mappings.size(); i++) {
++        if (mappings[i]) {
++            map_addr[i] = (const uint8_t *) mappings[i]->addr();
++            map_size[i] = mappings[i]->size();
++        }
++    }
++
++    const llama_moe_stream_weight * probe = nullptr;
++    for (const auto & sl : layers) {
++        if (sl && !sl->weights.empty()) {
++            probe = &sl->weights.front();
++            break;
++        }
++    }
++
++    bool ok = probe != nullptr && probe->file_idx < map_addr.size() && map_addr[probe->file_idx] != nullptr;
++    if (ok) {
++        const size_t len = std::min<size_t>(probe->nb_expert, 64*1024);
++        ok = probe->offs + len <= map_size[probe->file_idx];
++        if (ok) {
++            uint8_t * tmp = (uint8_t *) moe_aligned_alloc(len + 2*MOE_STREAM_DIRECT_ALIGN);
++            GGML_ASSERT(tmp != nullptr);
++            const uint8_t * via_read = llama_moe_stream_pread(*files[probe->file_idx], tmp, len, probe->offs, false);
++            ok = via_read != nullptr && memcmp(via_read, map_addr[probe->file_idx] + probe->offs, len) == 0;
++            moe_aligned_free(tmp);
++        }
++    }
++
++    if (!ok) {
++        LLAMA_LOG_WARN("%s: mapped slab does not match a read, uploading from staging instead\n", __func__);
++        map_addr.clear();
++        map_size.clear();
++    }
++
++    if (debug) {
++        fprintf(stderr, "moe stream: mmap upload %s\n", map_addr.empty() ? "off" : "on");
++        fflush(stderr);
++    }
++#endif
++}
++
++std::vector<size_t> llama_moe_stream::slab_sizes() const {
++    std::vector<size_t> out;
++    for (const auto & sl : layers) {
++        if (!sl) {
++            continue;
++        }
++        for (const auto & wt : sl->weights) {
++            if (std::find(out.begin(), out.end(), wt.nb_expert) == out.end()) {
++                out.push_back(wt.nb_expert);
++            }
++        }
++        break; // every streamed layer has the same weight shapes
++    }
++    return out;
++}
++
++ggml_backend_buffer_type_t llama_moe_stream::pinned_buft() const {
++    for (const auto & [buft, ctx] : ctxs) {
++        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
++        if (dev == nullptr) {
++            continue;
++        }
++        if (auto * hb = ggml_backend_dev_host_buffer_type(dev)) {
++            return hb;
++        }
++    }
++    return nullptr;
++}
++
+ size_t llama_moe_stream::size_bufs() const {
+     size_t size = 0;
+     for (const auto & buf : bufs) {
+@@ -444,6 +1766,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
++    const int64_t t_remap0 = ggml_time_us();
++
+     GGML_ASSERT(a->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(ggml_are_same_shape(a, dst));
+@@ -480,9 +1804,16 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+                 sl->il, sl->uniq.size(), sl->n_slots);
+     }
+ 
++    if (mgr->trace != nullptr) {
++        const int32_t hdr[2] = { sl->il, (int32_t) sl->uniq.size() };
++        fwrite(hdr, sizeof(int32_t), 2, mgr->trace);
++        fwrite(sl->uniq.data(), sizeof(int32_t), sl->uniq.size(), mgr->trace);
++    }
++
+     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
+     for (const int32_t e : sl->uniq) {
+         sat_inc(sl->route_hotness[e]);
++        sat_inc(sl->route_total[e]);
+     }
+     if (mgr->hot_decay_interval > 0 && mgr->stats.n_calls % mgr->hot_decay_interval == 0) {
+         for (auto & sl2 : mgr->layers) {
+@@ -494,6 +1825,44 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+         }
+     }
+ 
++    // Ask the OS for every slab this call will miss on, in one batched call, before any worker
++    // starts uploading. The upload reads the mapped file, so a slab still on disk would otherwise
++    // be faulted in page by page while a worker blocks on it; one PrefetchVirtualMemory turns that
++    // into concurrent large reads. Residency can change while the lock is dropped - this only
++    // changes when the I/O starts, never which experts get computed.
++    if (!mgr->map_addr.empty()) {
++        mgr->pf_ranges.clear();
++        for (const int32_t e : sl->uniq) {
++            if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
++                continue;
++            }
++            for (const auto & wt : sl->weights) {
++                const uint8_t * base = mgr->map_addr[wt.file_idx];
++                if (base != nullptr) {
++                    mgr->pf_ranges.push_back({ (void *) (base + wt.offs + (size_t) e*wt.nb_expert), wt.nb_expert });
++                }
++            }
++        }
++        if (!mgr->pf_ranges.empty()) {
++            lk.unlock();
++            llama_prefetch(mgr->pf_ranges);
++            lk.lock();
++        }
++    }
++
++    // MEASUREMENT ONLY. Maps every requested expert onto whatever is already in slot i and
++    // never loads anything, so a run measures the graph and GPU time with the expert stall
++    // removed. The output is garbage by construction - this exists to size the floor that no
++    // amount of I/O work can get under. LLAMA_MOE_STREAM_NOWAIT=1.
++    static const bool nowait = std::getenv("LLAMA_MOE_STREAM_NOWAIT") != nullptr;
++    if (nowait) {
++        for (int64_t i = 0; i < n; i++) {
++            out[i] = (int32_t) (ids[i] % (int32_t) sl->n_slots);
++        }
++        mgr->stats.t_remap_us += ggml_time_us() - t_remap0;
++        return;
++    }
++
+     // classify the touched experts; reserve and enqueue demand loads in deterministic order
+     std::fill(sl->keep.begin(), sl->keep.end(), 0);
+     sl->demand_slots.clear();
+@@ -504,8 +1873,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+         if (it != sl->expert_slot.end()) {
+             const int32_t s = it->second;
+             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+-                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
+-                mgr->cv_work.notify_one();
++                mgr->enqueue_weights_locked(*sl, e, s);
+                 waited = true;
+             }
+             mgr->stats.n_hit++;
+@@ -524,8 +1892,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+                 mgr->stats.n_miss_cold++;
+             }
+             mgr->reserve_slot_locked(*sl, e, v);
+-            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
+-            mgr->cv_work.notify_one();
++            mgr->enqueue_weights_locked(*sl, e, v);
+             mgr->stats.n_miss++;
+             waited = true;
+             sl->keep[v] = 1;
+@@ -557,6 +1924,15 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
++
++    mgr->stats.t_remap_us += ggml_time_us() - t_remap0;
++
++    if (mgr->heat_save_every > 0 && mgr->stats.n_calls - mgr->heat_last_save >= mgr->heat_save_every) {
++        mgr->heat_last_save = mgr->stats.n_calls;
++        mgr->save_heat();
++    }
++
++    mgr->print_stats_delta();
+ }
+ 
+ // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+@@ -641,8 +2017,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+                 // already in the cache (resident, or still loading from the previous wave's preload)
+                 const int32_t s = it->second;
+                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
+-                    cv_work.notify_one();
++                    enqueue_weights_locked(sl, e, s); // promote to demand, wait for it
+                     waited = true;
+                 } else {
+                     stats.n_preload_ready++; // resident from the previous wave's preload
+@@ -663,8 +2038,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+                     stats.n_miss_cold++;
+                 }
+                 reserve_slot_locked(sl, e, v);
+-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+-                cv_work.notify_one();
++                enqueue_weights_locked(sl, e, v);
+                 stats.n_miss++;
+                 waited = true;
+                 sl.keep[v] = 1;
+@@ -690,8 +2064,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+             }
+             reserve_slot_locked(sl, e, v);
+             sl.keep[v] = 1;
+-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+-            cv_work.notify_one();
++            enqueue_weights_locked(sl, e, v);
+             stats.n_preload_issued++;
+         }
+     }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 95032fa3d..421d7bc2e 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -68,12 +68,22 @@ struct llama_moe_stream_layer {
+     // residency state, guarded by mgr->mtx
+     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
+     std::vector<uint8_t>                 slot_state;    // [n_slots] llama_moe_stream_slot_state
+-    std::vector<uint8_t>                 slot_claimed;  // [n_slots] a worker owns the load
++    // One queue item per (slot, weight), so the gate, up and down slabs of an expert load on
++    // three workers at once. Loading them one after another on a single worker tripled the time a
++    // layer waits, and the remap waits for the slowest expert of the layer - so that serial chain
++    // set the decode rate. Both are bitmasks over weight index.
++    std::vector<uint32_t>                slot_claimed;  // [n_slots] weights a worker owns
++    std::vector<uint32_t>                slot_done;     // [n_slots] weights already loaded
+     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
+     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
+     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
+ 
+     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
++    // Undecayed selection counts. route_hotness is halved every 64 tokens so that eviction
++    // tracks recency, which also means an expert used steadily but rarely decays to 0 and
++    // disappears from the saved ranking - capping how deep a warm can go. The residency tier
++    // wants the opposite: a complete frequency ranking of everything the model actually uses.
++    std::vector<uint32_t> route_total;   // [n_expert]
+     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
+     int64_t use_counter = 0;
+ 
+@@ -97,6 +107,8 @@ struct llama_moe_stream_layer {
+     // stable userdata for wave w (grows lazily); called at graph build time only
+     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
+ 
++    uint32_t weights_mask() const { return (1u << weights.size()) - 1u; }
++
+     // whether the exps tensors passed to build_moe_ffn are this layer's cache tensors
+     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
+     bool matches(const ggml_tensor * gate, const ggml_tensor * up,
+@@ -109,7 +121,19 @@ struct llama_moe_stream_work {
+ 
+     int32_t  expert = -1;
+     int32_t  slot   = -1;
++    int32_t  widx   = 0; // index into layer->weights
+     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
++    uint32_t heat   = 0; // snapshot of route_total[expert], for the page-cache admission band
++};
++
++// one slab that has been read into staging and is waiting to go over PCIe
++struct llama_moe_stream_upload {
++    llama_moe_stream_layer * sl = nullptr;
++    int32_t  slot = -1;
++    int32_t  widx = 0;
++    uint64_t gen  = 0;
++    int32_t  buf  = -1;        // staging pool index, or -1 when src is used
++    const uint8_t * src = nullptr; // a page-locked hot-file slab: no staging needed
+ };
+ 
+ struct llama_moe_stream {
+@@ -136,14 +160,104 @@ struct llama_moe_stream {
+     // reopen the GGUF files for streaming reads
+     void open_files(const std::vector<std::string> & paths);
+ 
++    // keep the loader's mappings so a slab can be uploaded straight from the mapped file instead
++    // of being copied into staging by a read first; verifies one slab before it trusts them
++    void set_mappings(const llama_mmaps & mappings);
++
++    std::vector<const uint8_t *> map_addr; // per file, null when not mapped or not trusted
++    std::vector<size_t>          map_size;
++
++    // Off by default: uploading from the mapping removes the read, but then the page faults happen
++    // inside the CUDA copy, one cluster at a time and serialized across workers. Measured 2x worse
++    // than reading into staging. LLAMA_MOE_STREAM_MMAP_COPY=1 to try it anyway.
++    bool use_mmap_copy = false;
++
++    llama_memory_ranges pf_ranges; // scratch for the per-call batched prefetch, guarded by mtx
++
+     size_t size_bufs() const;
+ 
+     void print_stats() const;
+ 
++    // Persisted route hotness, so a restart does not have to rediscover the hot expert set.
++    // Reaching steady state from empty takes 400-600 tokens here, most of it spent filling the
++    // OS page cache by demand misses; replaying a saved ranking pulls that work forward.
++    // LLAMA_MOE_STREAM_HEAT=<path> enables both halves. Steady-state speed is unchanged -
++    // residency was measured not to set it - this only shortens the warm-up.
++    void save_heat() const;
++    void warm_from_heat();
++
++    std::string heat_path;    // empty = disabled
++    int64_t     heat_save_every = 0; // remap calls between saves (0 = only at shutdown)
++    int64_t     heat_last_save  = 0;
++    double      warm_extra_gb = 0.0; // LLAMA_MOE_STREAM_WARM_GB: also pull this much into the
++                                     // page cache beyond what fits in the device cache
++    void print_stats_delta(); // compact periodic line while LLAMA_MOE_STREAM_DEBUG is set
++
++    // pinned host buffer type of the cache device, or null when the backend has none
++    ggml_backend_buffer_type_t pinned_buft() const;
++
++    // distinct bytes-per-expert of the streamed weights of one layer (gate, up, down)
++    std::vector<size_t> slab_sizes() const;
++
++    bool use_pinned_staging = true; // LLAMA_MOE_STREAM_PINNED=0 to force plain host memory
++
++    int64_t dbg_every     = 0; // remap calls between periodic stat lines (0 = off)
++    int64_t dbg_last_call = 0;
++    struct { int64_t hit=0, miss=0, cold=0, stall=0, buf=0, nobuf=0, read=0, up=0,
++                     fast=0, med=0, slow=0, remap=0; } dbg_prev;
++
+     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
+ 
+     llama_files files; // privately reopened GGUF files, same indices as the loader's
+ 
++    // OS-page-cache admission band (LLAMA_MOE_STREAM_ADMIT=lo:hi, over route_hotness).
++    //
++    // Every buffered read of an expert slab also installs it in the page cache, which is the L2
++    // behind the VRAM cache. That is indiscriminate: a cold expert touched once evicts a warm one,
++    // and an expert hot enough to hold an L1 slot forever is cached twice over - in VRAM and in
++    // RAM - for no benefit. Slabs whose route hotness falls outside [lo, hi] are read with
++    // FILE_FLAG_NO_BUFFERING instead, so they neither consult nor disturb the page cache.
++    uint32_t admit_lo = 0;
++    uint32_t admit_hi = UINT32_MAX;
++
++    // One handle PER I/O WORKER per file, not one shared handle per file.
++    //
++    // A Windows file HANDLE opened without FILE_FLAG_OVERLAPPED is a *synchronous* file object:
++    // the I/O manager holds its lock for the duration of every ReadFile, so concurrent positional
++    // reads through one handle queue behind each other however many threads issue them. Measured
++    // on this drive with 6 threads and 448 KiB reads (bench/qd.py):
++    //      one shared handle    0.86 GB/s unbuffered / 1.81 GB/s buffered
++    //      one handle each      2.21 GB/s unbuffered / 5.80 GB/s buffered
++    // That single-handle serialization is why --moe-stream-io-threads, splitting an expert into
++    // three parallel weight loads, and removing the old global io mutex all measured as no-ops:
++    // the queue depth was pinned at 1 by the file object, not by the caller.
++    std::vector<std::vector<void *>> h_nobuf; // [worker][file] FILE_FLAG_NO_BUFFERING, or empty
++
++    // Expert slabs are read at random over a file far larger than RAM. fopen leaves the Windows
++    // cache manager free to apply its sequential heuristics, which read ahead past each slab and
++    // mark the pages for early trim - wasted bandwidth, and it evicts the slabs worth keeping.
++    // FILE_FLAG_RANDOM_ACCESS turns both off while keeping the reads buffered.
++    std::vector<std::vector<void *>> h_rand; // [worker][file]
++    bool one_handle = false; // LLAMA_MOE_STREAM_ONE_HANDLE=1: route every worker through set 0
++    bool use_random_access = true; // LLAMA_MOE_STREAM_RANDOM_ACCESS=0 to use the plain handles
++
++    bool serial_io = false; // LLAMA_MOE_STREAM_SERIAL_IO=1 restores the old seek+read under a lock
++
++    bool l2_direct = false; // LLAMA_MOE_STREAM_L2_DIRECT=1 uploads from the arena, no pinned staging
++
++    // Writable host memory can be pinned here even though read-only mappings cannot
++    // (cudaDevAttrHostRegisterSupported is 1, ReadOnlySupported is 0), so the L2 arena can be
++    // pinned and uploaded from directly - which removes the arena->staging copy.
++    // LLAMA_MOE_STREAM_L2_PIN=0 to keep it pageable.
++    bool l2_pin = true;
++
++    bool split_weights = true; // LLAMA_MOE_STREAM_SPLIT_WEIGHTS=0 loads an expert on one worker
++
++    // LLAMA_MOE_STREAM_TRACE=<path> appends every decode routing decision as
++    //   int32 layer, int32 n_ids, int32 ids[n_ids]
++    // so cache policies can be scored offline against the same trace
++    FILE * trace = nullptr;
++
+     size_t  max_nb_expert      = 0;
+     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
+ 
+@@ -170,6 +284,18 @@ struct llama_moe_stream {
+         int64_t n_miss      = 0; // demand loads issued
+         int64_t n_miss_cold = 0; // first-ever touch of an expert
+         int64_t t_stall_us  = 0; // wait time in miss handling
++        int64_t t_remap_us  = 0; // whole remap callback, wait included - the serial MoE cost
++        int64_t t_read_us   = 0; // summed over workers, so it can exceed wall time
++        int64_t t_upload_us = 0; // host -> device copy of the slabs
++
++        // slab reads bucketed by latency: a page-cache hit is a memcpy and lands far below the
++        // time even one NVMe read takes, so the split says how much of the tail is really on disk
++        int64_t n_fast = 0; // < 150 us
++        int64_t n_med  = 0; // < 600 us
++        int64_t n_slow = 0;
++
++        int64_t n_buffered   = 0; // slab reads that went through the page cache (inside the band)
++        int64_t n_unbuffered = 0; // slab reads that bypassed it (outside the band)
+ 
+         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
+         int64_t n_waves_run      = 0; // non-empty waves
+@@ -178,11 +304,74 @@ struct llama_moe_stream {
+         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
+     } stats;
+ 
++    // Page-locked hot-expert file (LLAMA_MOE_STREAM_HOT=<path>, built by bench/mkhot.py).
++    //
++    // A page-cache hit is cheap in I/O terms and expensive in memory terms: ReadFile memcpies
++    // the slab into pinned staging and the DMA then reads those bytes back, so delivering one
++    // byte to VRAM costs three passes over DRAM. On DDR4-2400 that, not the SSD, is what the
++    // stall is made of.
++    //
++    // ggml's own host registration asks for cudaHostRegisterReadOnly, which WDDM does not
++    // support here, so a read-only GGUF mapping can never be locked. A mapping opened
++    // READ-WRITE can be: measured 9.6-11.7 GB/s of DMA straight out of a registered 12 GiB
++    // file mapping with no copy at all (scratchpad/pinmap.cu). So the hottest experts get
++    // their own file, mapped read-write, locked once at startup, and uploaded in place -
++    // one DRAM pass instead of three, and locked pages can never fall back to disk.
++    std::string hot_path;              // empty = disabled
++    void *      hot_base = nullptr;    // the mapped, locked region
++    size_t      hot_size = 0;
++    void *      hot_file = nullptr;    // Windows HANDLEs, kept so they can be closed
++    void *      hot_map  = nullptr;
++    bool        hot_locked = false;
++    bool      (*host_lock)(void *, size_t) = nullptr;
++    void      (*host_unlock)(void *)       = nullptr;
++    // (split index << 48 | byte offset of the slab in that split) -> offset inside hot_base.
++    // Keyed on where the slab lives in the GGUF, never on (layer, weight position): a layer's
++    // weights are registered in model-builder order, and qwen4exp creates ffn_down_exps before
++    // gate/up, so a positional key silently serves the wrong tensor - fast, and all "!!!!".
++    std::unordered_map<uint64_t, size_t> hot_index;
++
++    void open_hot_file();
++    void close_hot_file();
++    const uint8_t * hot_lookup(uint16_t file_idx, size_t src_offs, size_t nb) const;
++
++    // Decoupled upload.
++    //
++    // With the read and the upload done back to back on the same worker, a layer costs
++    // (slowest read) + (all of its uploads), because every item's read finishes at about the
++    // same moment and the copies then queue on the one copy engine. Reads go through a staging
++    // pool instead and one uploader thread drains it, so a slab crosses PCIe while the other
++    // workers are still reading, and the uploader synchronizes once per drain rather than once
++    // per slab - 10.3 -> 12.8 GB/s on this link (scratchpad/h2d.cu).
++    //
++    // MEASURED: this loses slightly (10.5-10.7 vs 10.9 tok/s), so it is OFF by default -
++    // LLAMA_MOE_STREAM_ASYNC_UP=1 to enable. The reason it does not pay here is that a layer
++    // only has ~8 slabs and they finish reading at very different times (page cache ~150 us,
++    // disk ~800 us), so the uploader drains one or two at a time and never forms the batch
++    // the one-sync-per-batch win needs, while the extra hand-off costs a thread wake per slab.
++    void (*h2d_async)(ggml_tensor *, const void *, size_t, size_t) = nullptr;
++    void (*h2d_sync)(void) = nullptr;
++    bool async_upload = false;
++
++    ggml_backend_buffer_t         staging_buf = nullptr; // one pinned allocation, n_staging slabs
++    uint8_t *                     staging_base = nullptr;
++    size_t                        staging_stride = 0;
++    int32_t                       n_staging = 0;
++    std::vector<int32_t>          staging_free;  // free list of slab indices
++    std::deque<llama_moe_stream_upload> q_upload;
++    std::condition_variable       cv_upload;     // work for the uploader, or a freed staging slab
++    std::thread                   uploader;
++
++    void uploader_loop();
++    bool init_staging_pool();
++    void free_staging_pool();
++
+     // internals
+     void start_workers_locked();
+-    void worker_loop();
++    void worker_loop(int32_t wid);
+     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
+     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
++    void enqueue_weights_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+ 
+     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
+     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 382c9b217..d38695e2d 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -316,7 +316,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
+-        if (params.moe_stream &&
++        // LLAMA_MOE_STREAM_KEEP_MMAP=1 keeps mmap on, so the OS page cache acts as an
++        // L2 behind the VRAM expert cache. Only safe when RAM can hold a useful slice.
++        const char * keep_mmap_env = getenv("LLAMA_MOE_STREAM_KEEP_MMAP");
++        const bool keep_mmap = keep_mmap_env && atoi(keep_mmap_env) != 0;
++        if (params.moe_stream && !keep_mmap &&
+             (params.load_mode == LLAMA_LOAD_MODE_AUTO ||
+              params.load_mode == LLAMA_LOAD_MODE_MMAP ||
+              params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK)) {

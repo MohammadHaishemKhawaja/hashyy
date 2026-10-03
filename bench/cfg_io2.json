@@ -1,0 +1,27 @@
+[
+ {
+  "name": "q_io1",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 1 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "q_io2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 2 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "q_io4",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "q_io10",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "q_io2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 2 --poll 0",
+  "env": {}
+ }
+]

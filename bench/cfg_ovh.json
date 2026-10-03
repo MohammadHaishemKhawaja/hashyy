@@ -1,0 +1,36 @@
+[
+ {
+  "name": "o_ctl",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "o_nosplit",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_SPLIT_WEIGHTS": "0"
+  }
+ },
+ {
+  "name": "o_nosplit_i6",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 6 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_SPLIT_WEIGHTS": "0"
+  }
+ },
+ {
+  "name": "o_c65",
+  "args": "--moe-stream --moe-stream-cache 6.5 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "o_c68_np1",
+  "args": "--moe-stream --moe-stream-cache 6.8 --moe-stream-io-threads 10 --poll 0 -np 1",
+  "env": {}
+ },
+ {
+  "name": "o_ctl2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ }
+]

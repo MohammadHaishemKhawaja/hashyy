@@ -1,0 +1,14 @@
+[
+ {
+  "name": "f_real",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "f_nowait",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_NOWAIT": "1"
+  }
+ }
+]

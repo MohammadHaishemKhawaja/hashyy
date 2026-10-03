@@ -1,0 +1,6 @@
+[
+ {"name":"ad_off","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0"},
+ {"name":"ad_lo2","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0","env":{"LLAMA_MOE_STREAM_ADMIT":"2:4294967295"}},
+ {"name":"ad_lo3","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0","env":{"LLAMA_MOE_STREAM_ADMIT":"3:4294967295"}},
+ {"name":"ad_lo5","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0","env":{"LLAMA_MOE_STREAM_ADMIT":"5:4294967295"}}
+]

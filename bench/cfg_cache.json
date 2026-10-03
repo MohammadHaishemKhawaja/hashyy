@@ -1,0 +1,32 @@
+[
+ {
+  "name": "c_2",
+  "args": "--moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 2",
+  "env": {}
+ },
+ {
+  "name": "c_4",
+  "args": "--moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 4",
+  "env": {}
+ },
+ {
+  "name": "c_6",
+  "args": "--moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 6",
+  "env": {}
+ },
+ {
+  "name": "c_8",
+  "args": "--moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 8",
+  "env": {}
+ },
+ {
+  "name": "c_np1_c8",
+  "args": "-np 1 --moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 8",
+  "env": {}
+ },
+ {
+  "name": "c_np1_c9",
+  "args": "-np 1 --moe-stream --moe-stream-io-threads 10 --poll 0 --moe-stream-cache 9",
+  "env": {}
+ }
+]

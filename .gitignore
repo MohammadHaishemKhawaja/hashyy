@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Weights and anything derived from them. ~109 GB lives here; none of it
+# belongs in git. See README section "If you cloned this" for where to get it.
+# ---------------------------------------------------------------------------
+models/
+*.gguf
+*.hot
+*.hot.idx
+
+# The portable toolchain (CUDA redist, CMake, Ninja) - 6.4 GB, and not ours
+build-tools/
+
+# Prebuilt upstream binaries shipped alongside this tree
+llama/
+
+# The llama.cpp checkout. The local changes are carried as patches/ instead,
+# so this repo does not vendor a 1.3 GB clone of someone else's project.
+src/
+
+# Build output
+**/build-ms/
+**/build-mc/
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Per-run state: KV slot dumps, and the expert ranking the server accumulates.
+# expert.heat is YOUR usage - it is also how a benchmark gets contaminated, so
+# it is deliberately not shared. bench/expert_train.heat IS committed, because
+# it is built from a fixed public prompt set and is what reproducible numbers
+# must be built from.
+kvcache/
+bench/expert.heat
+
+# Server logs and sweep scratch. logs-archive/ IS committed - it is the raw evidence
+# behind RESULTS.md - but bench/logs/ is 2.3 MB of per-config noise and is not.
+bench/logs/
+bench/*.log
+bench/sweep_out.txt
+bench/diskprobe_out.txt
+bench/qual_*.txt
+
+# Local scratch
+scratchpad/*.exe
+scratchpad/*.exp
+scratchpad/*.lib
+
+# Derived from YOUR model files (268 KB of absolute paths). Regenerate with:
+#   python bench/gguf_map.py
+bench/gguf_map.json

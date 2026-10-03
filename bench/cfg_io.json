@@ -1,0 +1,6 @@
+[
+ {"name":"io06","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 6 --poll 0"},
+ {"name":"io10","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0"},
+ {"name":"io14","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 14 --poll 0"},
+ {"name":"io20","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 20 --poll 0"}
+]

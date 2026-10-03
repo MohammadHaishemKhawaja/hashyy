@@ -1,0 +1,31 @@
+[
+ {
+  "name": "u_off",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ASYNC_UP": "0"
+  }
+ },
+ {
+  "name": "u_on",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "u_on_i6",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 6 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "u_on_i16",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 16 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "u_off2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ASYNC_UP": "0"
+  }
+ }
+]

@@ -1,0 +1,12 @@
+[
+ {
+  "name": "h_a",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "h_b",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ }
+]

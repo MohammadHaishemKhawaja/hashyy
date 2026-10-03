@@ -1,0 +1,6 @@
+[
+ {"name":"v_np4_c6","args":"--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0"},
+ {"name":"v_np1_c7","args":"-np 1 --moe-stream --moe-stream-cache 7 --moe-stream-io-threads 10 --poll 0"},
+ {"name":"v_np1_c8","args":"-np 1 --moe-stream --moe-stream-cache 8 --moe-stream-io-threads 10 --poll 0"},
+ {"name":"v_np1_c85","args":"-np 1 --moe-stream --moe-stream-cache 8.5 --moe-stream-io-threads 10 --poll 0"}
+]

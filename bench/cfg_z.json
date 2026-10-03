@@ -1,0 +1,36 @@
+[
+ {
+  "name": "z_ctl4",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "z_ctl10",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "z_nopin",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_PINNED": "0"
+  }
+ },
+ {
+  "name": "z_noran",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_RANDOM_ACCESS": "0"
+  }
+ },
+ {
+  "name": "z_io6",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 6 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "z_ctl4b",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ }
+]

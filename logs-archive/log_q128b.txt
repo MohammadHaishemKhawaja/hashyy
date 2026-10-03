@@ -1,0 +1,23 @@
+0.00.096.067 I srv  llama_server: initializing ...
+0.00.096.075 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.096.379 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.103.615 I srv    load_model: loading model 'C:\Users\idont\Downloads\4\models\reap128\Qwen3.8-Flash-Next-REAP128-86B-Unity-OpenCode-UD-IQ4_XS.gguf'
+0.01.660.432 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+preflight:
+  model      : 45.5 GB
+  RAM        : 31.9 GB total, 7.4 GB available
+  usable     : -0.6 GB (after 8 GB headroom)
+  oversized  : YES -> mmap is MANDATORY
+  enforced   : --load-mode mmap --lazy-mode on
+
+launching: C:\Users\idont\Downloads\4\models\reap128\Qwen3.8-Flash-Next-REAP128-86B-Unity-OpenCode-UD-IQ4_XS.gguf --load-mode mmap --lazy-mode on -ngl 99 -ncmoe 36 -ub 256 -fa on -ctk q8_0 -ctv q8_0 -c 4096 --jinja --port 8099 --host 127.0.0.1 
+
+  [watchdog] free RAM 0.6 GB < 0.8 GB (1/8)
+  [watchdog] free RAM 0.0 GB < 0.8 GB (2/8)
+  [watchdog] free RAM 0.1 GB < 0.8 GB (3/8)
+  [watchdog] free RAM 0.3 GB < 0.8 GB (4/8)
+  [watchdog] free RAM 0.4 GB < 0.8 GB (5/8)
+  [watchdog] free RAM 0.3 GB < 0.8 GB (6/8)
+  [watchdog] free RAM 0.1 GB < 0.8 GB (7/8)
+  [watchdog] free RAM 0.4 GB < 0.8 GB (8/8)
+  [watchdog] KILLING server to protect the system

@@ -1,0 +1,31 @@
+[
+ {
+  "name": "L_h11",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ASYNC_UP": "1",
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "L_h14",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ASYNC_UP": "1",
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "L_h14b",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ASYNC_UP": "1",
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "L_ctl",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ }
+]

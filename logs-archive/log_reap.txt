@@ -1,0 +1,46 @@
+0.00.002.974 I srv  llama_server: initializing ...
+0.00.121.325 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.121.661 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.135.139 I srv    load_model: loading model 'C:\Users\idont\Downloads\4\models\reap256\Qwen3.8-Flash-Next-UD-Q3_K_XL-reap256-00001-of-00002.gguf'
+0.06.121.882 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.09.666.990 I cmn          init: llama threadpool init, n_threads = 6
+0.10.167.810 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 4096, kv_unified = 'true'
+0.10.174.876 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.10.174.895 I srv  llama_server: model loaded
+0.10.174.898 I srv  llama_server: listening on http://127.0.0.1:8099
+0.10.987.346 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.10.987.406 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.15.083.180 I slot print_timing: id  3 | task 0 | prompt eval time =    1416.10 ms /    21 tokens (   67.43 ms per token,    14.83 tokens per second)
+0.15.083.186 I slot print_timing: id  3 | task 0 |        eval time =    2679.63 ms /    31 tokens (   89.32 ms per token,    11.20 tokens per second)
+0.15.083.187 I slot print_timing: id  3 | task 0 |       total time =    4095.72 ms /    52 tokens
+0.15.083.188 I slot print_timing: id  3 | task 0 |    graphs reused =         30
+0.15.083.211 I slot      release: id  3 | task 0 | stop processing: n_tokens = 51, truncated = 0
+0.15.397.014 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.167 (> 0.100 thold), f_keep = 0.059
+0.15.455.430 I slot launch_slot_: id  3 | task 33 | processing task, is_child = 0
+1.13.149.683 I slot print_timing: id  3 | task 33 | n_gen =    100, tg =   1.74 t/s, tg_3s =   1.76 t/s
+preflight:
+  model      : 57.7 GB
+  RAM        : 31.9 GB total, 27.5 GB available
+  usable     : 19.5 GB (after 8 GB headroom)
+  oversized  : YES -> mmap is MANDATORY
+  enforced   : --load-mode mmap --lazy-mode on
+
+launching: C:\Users\idont\Downloads\4\models\reap256\Qwen3.8-Flash-Next-UD-Q3_K_XL-reap256-00001-of-00002.gguf --load-mode mmap --lazy-mode on --fit on --fit-target 384 -fa on -ctk q8_0 -ctv q8_0 -ub 128 -c 4096 --jinja --port 8099 --host 127.0.0.1 
+
+  [watchdog] free RAM 0.8 GB < 0.8 GB (1/8)
+  [watchdog] free RAM 0.6 GB < 0.8 GB (2/8)
+1.16.281.037 I slot print_timing: id  3 | task 33 | n_gen =    125, tg =   2.07 t/s, tg_3s =   7.98 t/s
+  [watchdog] free RAM 0.6 GB < 0.8 GB (3/8)
+1.18.063.774 I slot print_timing: id  3 | task 33 | prompt eval time =     848.54 ms /    18 tokens (   47.14 ms per token,    21.21 tokens per second)
+1.18.063.782 I slot print_timing: id  3 | task 33 |        eval time =   61759.00 ms /   140 tokens (  444.31 ms per token,     2.25 tokens per second)
+1.18.063.809 I slot print_timing: id  3 | task 33 |       total time =   62607.55 ms /   158 tokens
+1.18.064.097 I slot print_timing: id  3 | task 33 |    graphs reused =        168
+1.18.069.342 I slot      release: id  3 | task 33 | stop processing: n_tokens = 157, truncated = 0
+1.18.441.662 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 0.185 (> 0.100 thold), f_keep = 0.032
+1.18.621.649 I slot launch_slot_: id  3 | task 175 | processing task, is_child = 0
+  [watchdog] free RAM 0.7 GB < 0.8 GB (4/8)
+  [watchdog] free RAM 0.5 GB < 0.8 GB (5/8)
+  [watchdog] free RAM 0.4 GB < 0.8 GB (6/8)
+  [watchdog] free RAM 0.3 GB < 0.8 GB (7/8)
+  [watchdog] free RAM 0.3 GB < 0.8 GB (8/8)
+  [watchdog] KILLING server to protect the system

@@ -1,0 +1,37 @@
+[
+ {
+  "name": "C_4k",
+  "args": "-np 1 -c 4096 --moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "C_16k",
+  "args": "-np 1 -c 16384 --moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "C_32k",
+  "args": "-np 1 -c 32768 --moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "C_65k",
+  "args": "-np 1 -c 65536 --moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "C_131k",
+  "args": "-np 1 -c 131072 --moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ }
+]

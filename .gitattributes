@@ -1,0 +1,10 @@
+# route.trace is packed int32 records, NOT text. Without this git would apply
+# CRLF conversion on Windows and silently corrupt every offline analysis.
+*.trace  binary
+*.jsonl  text eol=lf
+*.heat   text eol=lf
+*.patch  text eol=lf
+*.sh     text eol=lf
+*.py     text eol=lf
+*.bat    text eol=crlf
+*.md     text

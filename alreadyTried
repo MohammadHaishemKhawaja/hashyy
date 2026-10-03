@@ -1,0 +1,679 @@
+ALREADY TRIED
+
+RESULT: 8.14 tok/s on the FULL UNPRUNED 177B, up from 6.56. Details at the bottom.
+
+############################################################################
+# DOES NOT WORK ON THIS BOX - the short list. Do not spend time on these.
+# Every line was built and measured here. Details in the sections below.
+############################################################################
+
+READ PATH / IO
+  positional ReadFile, global io_mtx removed      7.41 -> 7.43   NULL
+  FILE_FLAG_RANDOM_ACCESS handles                 7.69 -> 7.71   NULL
+  pinned staging buffer                           6.62 -> 6.52   NULL
+  upload direct from mmap + PrefetchVirtualMemory 7.69 -> 3.23   2x WORSE
+  split expert into 3 parallel per-weight loads   136.4 -> 136.7 ms  NULL
+  --moe-stream-io-threads 12 / 18                 7.51 / 7.67 vs 8.10 at 6
+  --moe-stream-io-threads 8 (session 1)           no change
+  --moe-stream-direct / O_DIRECT                  no-op on Windows (GGML_UNUSED)
+  --load-mode dio                                 CRASHED THE MACHINE
+
+HOST RAM TIERS - all five variants lose, stop trying
+  L2 pageable copying 8/12/16/19 GiB              6.11 / 6.46 / 7.07 / 7.91 vs 7.95
+  L2 zero-extra-copy (arena as staging)           6.40 / 7.04 / 7.94
+  L2 pinned staging                               7.12 / 7.91
+  L2 pinned DMA 12 GiB (55% hit rate!)            6.95 vs 8.14, stall +21.3%
+  L2 pageable 12 GiB                              6.92  (same as pinned -> it is the
+                                                   RAM being taken, not the DMA path)
+  heat-ranked host L2 (session 1)                 5.48 -> 4.43-5.09
+  cache in host RAM via -ncmoe 48                 2.35
+  16 GiB pinned allocation                        FAILS, 14 GiB is the ceiling
+
+VRAM / CACHE SIZING
+  79 L1 slots via -np 1 (misses -17%)             8.20 -> 8.16   NULL
+  --moe-stream-cache 24G+                         FAILS, VRAM-capped
+  tight ctx 2048 / ubatch 64                      3.2-5.1
+  -ot evict token_embd + output to CPU            5.38 / 3.04 / 2.98
+  fine-grained -ot (partial layers, down_exps)    worse at equal VRAM
+  FFN-only -ot on dense                           1.73-3.10 vs 4.88
+
+CACHE POLICY - LRU is already optimal here
+  ARC                                             68.5% = LRU 68.5%
+  2Q                                              66.9%, worse than LRU
+  frequency-based admission band                  55.9%, MUCH worse
+  (BELADY offline optimum is 81.6%, unreachable online)
+
+PREFETCH / SPECULATION - not viable
+  cross-layer co-occurrence predictor             39% recall, 5.9 wasted/layer-token
+  previous-token expert set                       36.7% recall
+  marginal / globally hottest                     13.5% recall
+  ngram-cache / ngram-mod / ngram-map-k           6.30 -> 6.34
+  MTP (unsloth + official ggml-org heads)         both fail to load, no nextn block
+
+THREADS
+  --poll 0 -t 2                                   6.71 vs 7.92
+  --poll 0 -t 1                                   7.70 vs 7.92
+
+THE OTHER FORK (from the anndev.org link)
+  GenerelSchwerz moe-cache branch, built here     1.72 vs 6.70
+                                                  cudaDevAttrHostRegisterReadOnlySupported
+                                                  = 0 on Windows WDDM, so its host expert
+                                                  tier refuses all 48 layers. Cannot work
+                                                  on this OS. See its section below.
+
+WARMING TUNING
+  WARM_GB=8 vs 4                                  median 6.87 vs 7.13, use 4
+
+QUALITY-REJECTED
+  REAP-256 / REAP-128 pruning                     fast but world knowledge damaged
+  ik_llama.cpp                                    documented Qwen3-MoE regression
+
+WHAT DID WORK:  io-threads 6, --poll 0, KEEP_MMAP=1, and the persisted heat map
+                (first prompt 2.2x faster). Total 6.56 -> 8.14.
+WHAT WOULD WORK: a non-APU CPU. The 5600GT is Cezanne = PCIe Gen3, which caps the
+                NVMe at the 2.85 GB/s measured here, and the expert stall already
+                runs at ~90% of it. A Ryzen 5 5600/5600X (~$80) gives Gen4 ->
+                expected 11-13 tok/s with no code change.
+
+############################################################################
+
+=== HARDWARE / PLATFORM ===
+- dual GPU (5070 + 3060): -sm layer, -sm tensor, -sm row        tensor 70/30 best; row OOMs
+- single 5070 only (3060 later removed from system)
+- PCIe measured: gen.max 3, x16                                 ~12 GB/s usable
+- SSD measured: 1.14 GB/s random @1.9MB, 1.66 GB/s sequential
+- RAM: DDR4-3600 kit running at 2400, DOCP never enabled
+- Windows standby/page cache measured: 23.27 GB in use
+
+=== DENSE Qwen3.8-27B ===
+- -ngl sweep single GPU                                         peak 4.88 @ ngl 46
+- tensor split sweep dual GPU                                   31.92 @ 70/30
+- FFN-only offload via -ot, attention kept on GPU                1.73-3.10, WORSE
+- MTP speculative decoding                                      5.21 -> 7.53, 74% accept
+- draft depth 3 / 6 / 10                                        3 best; deeper wastes
+- ngram-cache, ngram-mod, stacked with MTP                      all WORSE
+
+=== Qwen3.6-35B-A3B MoE ===
+- -ncmoe sweep (0..48), fine sweep around knee                  43.85 @ 22 (Q4_K_M)
+- IQ3_XXS vs Q4_K_M                                             IQ3 moved cliff 22->7
+- MTP at several residency points                               +1.22-1.25x on Q4, 0.97x on IQ3
+- ubatch 512/256/128, KV q8_0 vs q4_0                           no cliff movement
+- fine-grained -ot (partial layers, down_exps only, gate/up)    WORSE at equal VRAM
+- -ot ordering gotcha: must precede -ncmoe or it silently no-ops
+
+=== Qwen3.8-Flash-Next 177B (FULL, UNPRUNED) ===
+- plain mmap stock binary                                       3.75
+- --n-cpu-moe variants
+- --lazy-mode off / auto / on                                   no difference
+- --load-mode dio                                               CRASHED THE MACHINE (allocates full model)
+- built llama.cpp master + MoE streaming PR #25294              18 conflicts, 3 compile fixes
+- --moe-stream cache 8/12/18/24G                                24G+ fails: VRAM-capped
+- --moe-stream-direct (O_DIRECT) vs buffered                    identical
+- cache placed in host RAM via -ncmoe 48                        2.35, WORSE
+- patched mmap-disable to opt-out (page cache as L2)            3.28 -> 6.56  BEST
+- cache sweep 3/4/5/6/7G with L2                                6G peak, 7G cliffs
+- --moe-stream-io-threads 8                                     no change
+- tight ctx 2048 / ubatch 64 to free VRAM                       3.2-5.1, WORSE
+- -ot evict token_embd + output to CPU, cache 7/8/9G            5.38 / 3.04 / 2.98, WORSE
+- ngram-mod / ngram-cache / ngram-map-k                         6.30 -> 6.34, nothing
+- MTP: unsloth head + official ggml-org head                    both fail, both builds
+                                                                (output_hc_norm.weight not found;
+                                                                 main GGUF has no nextn block)
+- built heat-ranked host-RAM L2 tier (LLAMA_MOE_STREAM_L2_GB)   5.48 -> 4.43-5.09, WORSE
+                                                                (steals RAM from the bigger OS page cache)
+
+=== PRUNED VARIANTS (rejected on quality) ===
+- REAP-256-duo Q3_K_XL                                          7.5 cold -> 2.2, watchdog killed
+- REAP128-86B IQ4_XS                                            14.41 stable
+- quality check both REAP variants                              world knowledge damaged
+                                                                ("capital of Australia is Australia")
+
+=== TOOLING / INFRASTRUCTURE ===
+- ik_llama.cpp                                                  rejected: documented Qwen3-MoE regression
+- CUDA toolchain from redist zips (no installer, no admin)      nvcc needs libnvvm's cicc
+- portable CMake + Ninja + MSVC 2022
+- safe_run.py preflight guard + RAM watchdog                    2 clean kills, 0 crashes after
+- GGUF tensor-offset analyzer                                   experts 45.29 GiB, PLE 26.82 GiB
+
+=== CEILINGS COMPUTED FROM MEASUREMENTS ===
+- experts in RAM -> GPU                                         13.2 tok/s (PCIe gen3)
+- experts on CPU, 95% hit                                       9.5 tok/s
+- experts on CPU, 100% hit (all resident)                       14.8 tok/s
+- current measured 6.56                                         implied hit rate ~81%
+
+=== WINDOWS I/O + CACHE PATH (session 2, all measured on the FULL 177B) ===
+Method note: routing is bit-exact deterministic, so the (L1 hit / miss / cold)
+triple identifies the same workload point in every run. bench/cmp.py compares two
+runs only at matched triples - raw medians drift up 3-5% per batch because the OS
+page cache warms across server restarts. Trust matched-state deltas, not medians.
+
+- positional ReadFile (OVERLAPPED offset), global io_mtx removed    7.41 -> 7.43  NULL
+                        (buffered Win reads already parallelise in the cache manager,
+                         so expert loads were never queue-depth starved)
+- FILE_FLAG_RANDOM_ACCESS buffered handles                         7.69 -> 7.71  NULL
+                        (no read-ahead amplification existed to remove)
+- pinned staging via ggml_backend_dev_host_buffer_type              6.62 -> 6.52  NULL
+                        (upload is ~11 ms wall of a ~130 ms token)
+- upload direct from mmap + batched PrefetchVirtualMemory          7.69 -> 3.23  MUCH WORSE
+                        (faults then happen inside the CUDA copy, per cluster,
+                         serialized across workers. side note: it drove the working
+                         set to 26.3 GiB and standby to 0.1 GiB, which proves ~26 GiB
+                         of RAM can be made resident)
+- split each expert into 3 per-weight work items (parallel gate/up/down)
+                        matched-state stall 136.4 -> 136.7 ms  NULL (+0.2%)
+                        medians 7.80 -> 8.02, within drift
+- io-threads 18 / 12 / 9 / 6                                       7.67 / - / 8.06 / 8.10
+                        (fewer is better: 9 I/O + 6 compute threads oversubscribe
+                         a 6-core/12-thread CPU)
+- rewritten host L2 arena (per-size pools, CLOCK evict, copy outside the lock,
+  arena doubles as staging) at 8/12/16/19/21 GiB
+                        L2 hit 42-58%, disk reads CUT BY HALF,
+                        matched-state stall 132.3 -> 136.2 ms  STILL 3% WORSE
+                        (a 19 GiB arena on a 32 GB box leaves 0 free RAM, so every
+                         arena write has to trim the page cache; that costs more than
+                         the disk reads it saves. the tier is zero-sum with the page
+                         cache and loses on net)
+
+=== OFFLINE ANALYSIS ON A RECORDED ROUTING TRACE (bench/*.py) ===
+LLAMA_MOE_STREAM_TRACE=<path> dumps every decode routing decision; 601 tokens.
+- L1 policy at 67 slots: LRU 68.5%, ARC 68.5%, 2Q 66.9%, BELADY 81.6%
+                        the shipped decaying-hotness policy already behaves exactly
+                        like LRU (hotness halves every 64 tokens so most experts tie
+                        at 0 and the LRU tiebreak decides) - it measures 70.0% live,
+                        which the LRU sim reproduces exactly.
+                        NO ONLINE POLICY BEATS LRU HERE. Do not build ARC/2Q/LIRS.
+- frequency-based admission band                                   55.9%  MUCH WORSE
+                        routing is recency-driven, not frequency-driven, which is what
+                        a load-balanced MoE router should look like
+- cross-layer prefetch predictability (the only way to overlap I/O with compute,
+  since layer L+1's router does not exist until L is done):
+      prev-token set    recall 36.7%, 6.4 wasted guesses per layer-token
+      co-occurrence     recall 39.0% @K=10, 5.9 wasted; 59.1% @K=24, 17.6 wasted
+      marginal/hottest  recall 13.5%
+                        PREFETCH IS NOT VIABLE. The hits land mostly on experts that
+                        are already L1-resident (hence free), while the wasted fetches
+                        would exceed the real miss count several times over.
+- zero-miss layers vs L1 slots (why capacity scales badly):
+      67 slots -> 15.2% of layer-tokens have no miss, so 40.7 of 48 layers stall
+      100      -> 24.5%, 36.2 stalling
+      180      -> 45.5%, 26.2 stalling
+                        40.7 stalling layers x 2.58 ms = 105 ms, which is the measured
+                        stall exactly. 2.7x the VRAM only removes a third of the stalls.
+
+=== MEASURED DECOMPOSITION (cache 6G, warm) ===
+  67 slots/layer of 512 experts = 13.1% L1 capacity
+  per expert: gate 490K iq2_s + up 490K iq2_s + down 900K iq4_nl = 1.815 MiB
+  per token : 480 expert reads = 871 MiB of weights touched
+  L1 hit 70% -> ~144 misses/tok = ~260 MiB from RAM or disk
+  remap total == stall == 85-135 ms, i.e. the whole token minus ~20 ms
+  token time == stall + ~20 ms (GPU compute + graph; GPU util only 17-20%)
+  drive, measured unbuffered+overlapped: 0.93 GB/s @512KiB QD1 -> 2.85 GB/s @QD4+
+  => at the control config the stall runs at ~90% of the drive's random-read limit
+  => 15 tok/s needs stall <= 47 ms; 20 tok/s needs stall <= 30 ms
+  The old "1.14 GB/s at expert granularity" figure was a QD1 buffered number; the
+  drive is faster than that, but raising the queue depth does not help (see nulls).
+
+=== FIXED BUGS IN THE INHERITED STREAMING CODE (none moved throughput) ===
+- Windows pread serialized every read behind one global mutex (seek+read). That is
+  also why --moe-stream-io-threads and --moe-stream-direct were both no-ops:
+  the mutex pinned queue depth to 1 and `direct` was GGML_UNUSED on Windows.
+- host L2 sized every slab to max_nb_expert (900K), wasting 410K on each 490K
+  gate/up slab = 30% of the arena.
+- host L2 evicted by an O(n_slabs) linear scan under its lock on every insert.
+- host L2 held its lock across the slab memcpy, serializing ~237 MiB/tok of copying.
+
+=== SESSION 2 CONCLUSION (measured, cold-cache, matched states) ===
+Headline A/B, cold start + interleaved + 40 matched cache states:
+  as inherited                                                      5.88 tok/s (stall 143.5)
+  best found                                                        6.70 tok/s (stall 130.7, -9.0%)
+Best = positional reads + split weights + pinned staging + io-threads 6 + --poll 0.
+Every bigger number seen during the session came from a warmer page cache, not code.
+
+- ggml threadpool busy-waits (cpuparams.poll default 50, ggml_barrier spins on
+  _mm_pause). The expert remap is a CPU op, so all 48 layers/token enter the
+  threadpool and the non-zero threads spin while thread 0 waits on I/O.
+      --poll 0                                                      7.66 -> 7.92  +3.4%
+      --poll 0 -t 2 / -t 1                                          6.71 / 7.70   WORSE
+- L2 arena retested at the right thread count (6) + --poll 0 + cold start:
+      no L2 7.76 vs L2-16GiB 7.31                                   STILL WORSE
+      reason: RAM is zero-sum. A 16-19 GiB arena leaves no free memory, so every
+      arena write forces the OS to reclaim a page, which costs more than the disk
+      read it saved. It halves disk reads every time and loses wall clock every
+      time. Right structure for a 64 GB box, wrong one for 32 GB.
+- VRAM reclamation for more L1 slots: -np 1 with cache 7 loads fine and gives
+  79 slots/layer instead of 67, L1 hit 70% -> 75.2%, misses 144 -> 119/tok
+                                                                    8.20 -> 8.16  NULL
+  (-ot "^token_embd=CPU" could not be tested: bench passes args unsplit so the
+   quotes reached the parser; not worth a retry given the slot result was null)
+
+MEASUREMENT TOOLING ADDED (bench/)
+- bench.py --cold / dropcache.py: the standby list kept GGUF pages across server
+  restarts and drifted every batch up 3-5%, enough to swamp real effects. No admin,
+  so NtSetSystemInformation(MemoryPurgeStandbyList) and SetSystemFileCacheSize are
+  unavailable; instead commit and touch private pages until the OS hands the standby
+  pages over, then release. Measured 18.96 -> 4.46 GiB, and repeatable to 0.01 GiB
+  (4.55 / 4.56 on consecutive runs). matrix.py passes --cold unless COLD=0.
+- cmp.py: routing is bit-exact deterministic, so the (L1 hit, miss/tok, cold) triple
+  identifies the same workload point in any run. Compare only matched triples.
+- policy.py / hier.py / predict.py: offline cache-policy, two-level-residency and
+  prefetch-predictability models over a recorded routing trace.
+
+THE REMAINING SOFTWARE IDEA (not attempted, arithmetic in bench/FINDINGS.md)
+Give the expert cache a host-memory home the GPU can read in place
+(cudaHostAllocMapped behind a ggml CUDA buffer type) instead of a VRAM cache filled
+by per-layer copies: 70% free VRAM hits + 20% read over PCIe at ~11 GB/s (16 ms) +
+10% from disk (31 ms) = ~47 ms stall + 20 ms compute = ~15 tok/s, and it deletes the
+per-layer fetch-and-wait chain. Needs ggml_backend_cuda_supports_buft to accept the
+host buffer type as a matmul operand location - a ggml change, not a streaming change.
+
+=== CORRECTION: "needs 64 GB" WAS WRONG ===
+anndev.org ran this exact model+quant at 10.8-12.4 tok/s decode on 12 GB VRAM and
+32 GB RAM (same RAM as this box):
+  https://anndev.org/posts/2026-09-12-running-177b-moe-models-on-12gb-gpu-llama-moe-cache/
+Two causes of the gap:
+ 1. their NVMe is on PCIe Gen4, ours is capped at Gen3 (Ryzen 5 5600GT = Cezanne,
+    pcie.link.gen.max=3). Measured drive ceiling here 2.85 GB/s and the stall already
+    runs at ~90% of it; Gen4 is roughly 2x, which maps 6.7 -> ~12. Hardware, not software.
+ 2. they use GenerelSchwerz/llama.cpp branch moe-cache, NOT PR #25294. Different
+    architecture: "cold experts live in CPU pinned memory", so a cache miss is a
+    pinned-host->VRAM DMA instead of a per-expert disk read handed to a worker and
+    waited on. That deletes the fixed per-layer fetch-and-wait chain that every
+    measurement in this session pinned as the binding cost. Also has grouped decode,
+    overlap, working MTP, and --moe-early-router (runs the next layer's router early
+    and prepacks its groups - the exact version of the prefetch that failed here as a
+    statistical predictor).
+Their flags independently match things measured here: -np 1, --cache-ram 0, and a
+SMALLER gpu cache (20-24 slabs on their 12 GB profile vs our 67), consistent with the
+finding that slot count is not the limiter.
+Flags: --moe-expert-cache-size N / --moe-expert-cache-mib / -host-pinned-mb /
+       -layers / --moe-early-router ; plus -ngl all -fit off -kvo --load-mode none
+       --cache-ram 0 -np 1
+WINDOWS HAZARD (their issue #104, unresolved): Flash-Next emits corrupted output
+(repeated "/") with the expert cache on Win11 unless budgets are explicit:
+  --moe-expert-cache-mib 2048 --moe-expert-cache-host-pinned-mb 2048
+=> ALWAYS quality-check output from this fork, do not just time it.
+Cloned to src/moecache, build via build-moecache.bat -> src/moecache/build-mc.
+
+=== moe-cache FORK BUILT AND TESTED ON THIS BOX: CANNOT WORK HERE ===
+GenerelSchwerz/llama.cpp branch moe-cache (e69cf66), built with the portable
+toolchain into src/moecache/build-mc. Loads fine, generates correct text, but:
+  --moe-expert-cache-mib 2048 --...-host-pinned-mb 2048   ~1.5 tok/s, disk 148 MB/s
+  --moe-expert-cache-mib 6144 --...-host-pinned-mb 18432  1.58 cold -> 1.72
+vs 6.70 on the PR fork. Startup refuses ALL 48 layers from the host tier:
+  moe-cache-host: admission group=N ... reason=read_only_registration_unsupported cuda=none
+
+ROOT CAUSE (verified with a CUDA probe, scratchpad/probe.cu):
+  cudaDevAttrHostRegisterSupported             = 1
+  cudaDevAttrHostRegisterReadOnlySupported     = 0   <-- the host tier requires it
+  cudaDevAttrPageableMemoryAccess              = 0
+  cudaDevAttrCanUseHostPointerForRegisteredMem = 0
+moe-cache-host.cu:627 demands cudaDevAttrHostRegisterReadOnlySupported because
+--load-mode mmap gives it a READ-ONLY file mapping (moe_cached_buffer_from_host_ptr
+wraps those read_only=true). cudaHostRegisterReadOnly does not exist under Windows
+WDDM, so the host expert tier - the whole point of the fork - is dead and every
+expert page-faults off the mmap. Same pathology already measured as 2x worse here.
+Their wiki says Windows needs a special WDDM partial-pinning setup; their issue
+#104 is the Windows breakage. This is that limitation, measured.
+
+WHY --load-mode none DOES NOT RESCUE IT: writable host registration IS supported
+(attr=1) and the fork has a writable path (llama-model-loader.cpp:1976, read_only=
+false, pins fine) - which is why their 12GB profile uses --load-mode none. But it
+needs experts in ordinary RAM: 45.29 GiB vs ~27 GiB available, and without mmap the
+26.82 GiB PLE table loses its lazy read too. Does not fit. --moe-expert-cache-layers
+would leave the unselected layers on the slow mmap-fault path.
+=> anndev's 10.8-12.4 needs a non-WDDM platform AND the Gen4 link.
+
+ALSO: --moe-expert-cache-mib and --moe-expert-cache-size are mutually exclusive
+("conflicts with a nonzero --moe-expert-cache-size"), and the build needs
+cudart64_13/cublas64_13/cublasLt64_13.dll copied into build-mc/bin or it exits
+with 0xC0000135 STATUS_DLL_NOT_FOUND.
+
+=== THE ONE CHANGE THIS BOX ACTUALLY NEEDS ===
+Ryzen 5 5600GT is Cezanne (APU) = PCIe Gen3 ONLY. That is the measured
+pcie.link.gen.max=3 and it caps the NVMe at the 2.85 GB/s measured here, with the
+expert stall already running at ~90% of that. A Vermeer CPU (Ryzen 5 5600/5600X,
+~$80-100 used) gives PCIe Gen4 on the B550 CPU-attached M.2 and roughly doubles the
+ceiling: 6.70 -> expected 11-13 tok/s with NO code change. 64 GB RAM second, Linux
+for the moe-cache fork third. Cheapest per tok/s by a wide margin.
+
+=== PINNED HOST MEMORY CEILING (measured, scratchpad/pinmax.cu) ===
+cudaHostAlloc(Portable|Mapped) walks up fine to 14 GiB and FAILS at 16 GiB
+("out of memory") on 32 GB of RAM. Two consequences:
+ 1. LLAMA_MOE_STREAM_L2_GB=16 silently logged "pageable" - the pinned alloc failed and
+    the code fell back to malloc, so that run measured the OLD copying path. The
+    startup banner now prints pinned/pageable for exactly this reason. Without it the
+    result reads as "pinning did not help" when pinning never happened.
+ 2. With cudaDevAttrHostRegisterReadOnlySupported=0, the most any host expert tier can
+    be on Windows here is ~14 GiB of WRITABLE pinned memory and zero pinned read-only
+    mmap - which is the thing the moe-cache fork needs.
+=> 12 GiB is the largest arena that actually pins. Being measured (S_ batch).
+
+=== CACHE WARMING: WORKS, AND IT IS A TIME-TO-FIRST-TOKEN FEATURE ===
+LLAMA_MOE_STREAM_HEAT=<path> (+ optional LLAMA_MOE_STREAM_WARM_GB=<n>).
+Startup on the second run: "warmed 3216 device slots + 0.00 GiB into the page cache
+in 6.7 s" - 3216 = 67 slots x 48 layers, i.e. every slot refilled from the saved
+ranking. Both runs cold-cache, every generation measured:
+                     cold    preloaded
+  1st prefill        2.29 -> 4.46   +95%
+  1st decode         5.52 -> 5.86   +6%
+  2nd prefill        4.09 -> 4.42   +8%
+  2nd decode         7.09 -> 6.98   -2%
+  3rd                noise
+Prefill touches far more distinct experts per step than decode, so a pre-filled L1
+helps it much more. Steady-state decode unchanged, consistent with L1 hit 70->75%
+and halving disk reads both measuring as nulls. Enabled in run-full177b.bat.
+THREE BUGS had to be fixed first:
+ - LRU stamps inverted: reserve_slot_locked bumps slot_last_use, so filling
+   hottest-first made the hottest expert the oldest and first to be evicted.
+ - route_hotness not restored: eviction ranks by hotness, so a zero-hotness warm set
+   was discarded within ~30 tokens. The file stores heat with the ranking for this.
+ - destructor-only save never fired: taskkill / window close / crash all use
+   TerminateProcess, no destructors. First test showed 7.19 vs 7.22 = two cold runs,
+   pure noise. Now checkpointed every ~256 tokens, .tmp + rename so a kill mid-save
+   cannot truncate it.
+CAVEAT for reporting: that test warmed on the same 8 prompts it measured. For a
+published number, warm on one prompt set and measure on another.
+
+=== PINNED L2 ARENA: pins fine, still loses (closes the last L2 variant) ===
+cudaDevAttrHostRegisterSupported=1, so WRITABLE host memory can be pinned here even
+though read-only mmap cannot. Allocated the L2 arena from ggml's pinned host buffer
+type so an L2 hit becomes a direct DMA out of the arena with no staging copy:
+  moe stream: L2 host cache 12.00 GiB, 8886 experts, 2 pools, pinned (uploads DMA from the arena)
+(16 GiB silently fell back to pageable - see the 14 GiB ceiling above. The banner now
+prints pinned/pageable so that can't be mistaken for "pinning didn't help".)
+
+Matched cache states vs its own cold control, at L1 71.9%:
+                      ctl      pinned-12
+  stall              117.5  -> 136.3   +16% WORSE
+  read summed        473.9  -> 459.2
+  upload summed       37.2  ->  57.9   +56%
+  src fast            33.7  -> 213.8
+  src med            171.7  ->  11.2
+  src slow (disk)    199.0  -> 179.4
+At L1 62.5%: stall 145.4 -> 176.7.
+Full run: ctl 8.14 tok/s vs pinned-12 6.95; mean stall over 32 matched states
+125.4 -> 152.1 ms (+21.3%). The arena's own hit rate was 55% - it served over half of
+every L1 miss from pinned host RAM and STILL lost 21%.
+
+CORRECTION from a pageable arm at the same size - it is the RAM, not the DMA path:
+                    tok/s   upload   src med
+  control            8.14     37.2    171.7
+  pinned-12 (DMA)    6.95     57.9     11.2
+  pageable-12 (copy) 6.92     66.8     41.1
+Pinned and pageable are IDENTICAL (6.95 vs 6.92), and the pageable arm never DMAs
+from the arena yet its upload is higher still. So "DMA out of a big arena is slower"
+was WRONG. The whole loss is that 12 GiB taken is 12 GiB the page cache no longer
+has: src med 171.7 -> 41.1/11.2, i.e. the arena REPLACED the middle tier instead of
+adding to it, and a 55%-hit arena is worth less than the page cache it displaced.
+
+=> EVERY L2 variant loses here: pageable copying (8/12/16/19 GiB), zero-extra-copy,
+pinned-staging, pinned-DMA. Not an implementation problem - on 32 GB there is no
+spare RAM to build a tier out of. Stop trying host tiers on this box.
+
+=== PAGE-CACHE WARMING (LLAMA_MOE_STREAM_WARM_GB): scales, but it MOVES the wait ===
+Unlike the L2 arena this allocates nothing - it reads the right slabs so the page
+cache holds them rather than letting demand misses fill it at random, so there is no
+zero-sum RAM penalty. Only startup time.
+First request, cold, every generation measured:
+  config          startup  1st prefill  1st decode
+  no warming        ~1 s      2.29         5.52
+  device slots       7.0 s    3.84         5.58
+  + 4 GiB           10.6 s    5.14         6.21
+  + 7.58 GiB        14.3 s    6.63         6.37
+Generations 2-4 identical across all four (7.04-7.31 / 6.70-6.95 / 8.20-8.22), so it
+is purely a warm-up feature. An 8 GiB request only warmed 7.58 GiB - the ranking ran
+out, because the heat file only lists experts actually routed to.
+
+WALL CLOCK (15-token prompt + 128 generated), startup included:
+  no warming 30.7 s | slots 33.8 (+3.1) | +4GiB 34.1 (+3.4) | +7.58GiB 36.7 (+5.9)
+WALL CLOCK with the server already up when you ask:
+  no warming 29.7 s | slots 26.8 (-2.9) | +4GiB 23.5 (-6.2) | +7.58GiB 22.4 (-7.4)
+=> Warming MOVES the wait from "waiting for an answer" to "before you typed", ~1:1.
+Win if the server stays running (how run-full177b.bat is used, so WARM_GB=8 is on),
+loss of 3-6 s if you launch fresh per question. Do not quote the percentages alone.
+
+=== RESULT: 8.14 tok/s (from 6.56) ===
+
+############################################################################
+# SESSION 3 - THE SHARED FILE HANDLE WAS THE BUG
+############################################################################
+
+ROOT CAUSE OF EVERY "NULL" ABOVE
+  llama_moe_stream::open_files opened ONE Windows HANDLE per GGUF split
+  (FILE_FLAG_RANDOM_ACCESS, no FILE_FLAG_OVERLAPPED) and every I/O worker issued
+  ReadFile through it with an OVERLAPPED offset. A synchronous Windows file object
+  holds its lock for the whole of each ReadFile, so those "positional, lock-free,
+  concurrent" reads were serialized by the kernel. Queue depth was pinned at 1 per
+  file no matter how many workers ran.
+
+  Measured directly (bench/qd.py, 6 threads, random reads over the 46 GiB split):
+      448 KiB unbuffered   shared handle 0.86 GB/s   per-thread handles 2.21 GB/s
+      896 KiB unbuffered   shared handle 1.31 GB/s   per-thread handles 2.71 GB/s
+      448 KiB buffered     shared handle 1.81 GB/s   per-thread handles 5.80 GB/s
+      896 KiB buffered     shared handle 3.03 GB/s   per-thread handles 11.49 GB/s
+
+  This is why --moe-stream-io-threads, splitting an expert into three parallel
+  weight loads, FILE_FLAG_RANDOM_ACCESS and removing the old global io_mtx all
+  measured as no-ops: none of them could raise a queue depth the file object held
+  at 1. The earlier note "buffered Windows reads already parallelise in the cache
+  manager" was wrong.
+
+FIX: one handle set per I/O worker (h_rand/h_nobuf are now [worker][file]).
+  Measured, same box, same flags, same prompts:
+      before   6.36 tok/s median   90.5 MiB/tok off disk at 523 MB/s
+      after   10.86 tok/s median   73.0 MiB/tok off disk at 734 MB/s
+  At exactly matched (L1 hit, miss/tok, cold) states the stall fell 35-42%:
+      71.9% state  117.5 -> 76.1 ms      70.0% state  154.9 -> 93.0 ms
+      62.5% state  145.4 -> 89.1 ms      64.0% state  365.3 -> 210.4 ms
+
+NEW MEASUREMENT TOOL: bench/diskprobe.py
+  Reads the PhysicalDisk and Memory perf counters around a fixed generation set, so
+  "MiB per token that actually left the SSD" is a measured number instead of being
+  inferred from the read-latency buckets. The debug line's f/m/s buckets cannot tell
+  a slow page-cache memcpy from a fast NVMe read; this can.
+  bench/sweep.py drives a json config list through it, one server per config.
+
+ALSO FIXED IN THE SAME PASS
+  - page-cache warming (LLAMA_MOE_STREAM_WARM_GB) ran single-threaded through the
+    one shared handle at ~1 GB/s; now parallel over the per-worker handles.
+  - warming read hottest-first, so the tail of the warm evicted the head of it.
+    Now coldest-first, which leaves the hottest resident.
+  - the saved heat ranking used route_hotness, which is halved every 64 tokens, so
+    steadily-but-rarely used experts decayed to 0 and vanished from the file. It
+    capped the ranking at ~7300 experts (13.5 GiB), which is less than the page
+    cache can hold. Added an undecayed route_total; heat file is now v2 and ranks
+    by it (v1 still loads).
+  - LLAMA_MOE_STREAM_ADMIT now keys on route_total, not route_hotness. With the
+    decayed value a warmed expert whose heat had aged out would be read UNBUFFERED,
+    i.e. from disk, for bytes already sitting in the page cache.
+  - MOE_STREAM_IO_THREADS_MAX 18 -> 32.
+
+MEASURED, DOES NOT HELP (session 3)
+  --moe-stream-io-threads 6 / 10 / 14 / 20 after the handle fix
+                                  10.19 / 9.95 / 10.18 / 10.33  FLAT
+                                  (per layer there are only ~8 read items, so extra
+                                   workers have nothing to do)
+  per-layer slot allocation instead of uniform (bench/alloc.py, exact LRU stack
+  distances + concave-envelope budget split over the recorded trace)
+                                  hit 68.45% -> 69.28% at the same total slots.
+                                  Layer hit rates vary 31-88%, but the optimal
+                                  split only removes 2.6% of misses. NOT WORTH IT.
+  lossless compression of expert slabs, to fit more of the 45.29 GiB in RAM
+                                  zlib-1 ratio 1.052 (BIGGER), zlib-6 0.990,
+                                  lzma-1 0.995 over a sample of iq2_s and iq4_nl
+                                  slabs. IQ quants are already at entropy. A
+                                  compressed host tier cannot exist. DEAD END.
+
+MEASURED FACTS THAT SET THE REMAINING CEILING
+  hidden 2560, expert intermediate 640, 10 of 512 experts over 48 layers
+  per expert 1925 KiB (47 layers: iq2_s 512.5 + 512.5 + iq4_nl 900)
+             2275 KiB (1 layer uses iq3_s for gate/up)
+  per token  905.8 MiB touched, ~141 misses = ~266 MiB has to cross PCIe
+  PCIe gen3 x16 at ~12 GB/s => 22 ms of upload per token is unavoidable
+  + ~20 ms of GPU compute  => ~42 ms, i.e. ~24 tok/s is the hardware ceiling
+                              at the current 70% L1 hit rate
+  so 20 tok/s needs the disk out of the critical path almost entirely, and
+  15 tok/s needs most of it.
+
+=== THE PAGE-LOCKED HOT-EXPERT FILE (the second real win) ===
+Why it exists: after the handle fix the remaining stall is not SSD bandwidth. Delivering one
+byte of expert weight to VRAM out of the OS page cache costs THREE passes over DRAM -
+ReadFile memcpies it into pinned staging, and the DMA then reads those bytes back. On
+DDR4-2400 that is the binding resource, not the drive.
+
+The blocker was believed to be fatal: ggml's own host registration asks for
+cudaHostRegisterReadOnly, and this box reports cudaDevAttrHostRegisterReadOnlySupported = 0,
+so a read-only GGUF mapping can never be page-locked. That is true, and it is what kills the
+GenerelSchwerz moe-cache fork here.
+
+THE WAY AROUND IT: open the file READ-WRITE and map it PAGE_READWRITE. Plain (writable)
+registration IS supported (attr = 1). Nothing ever writes through the mapping.
+Measured (scratchpad/pinmap.cu), DMA straight out of a registered file mapping, no copy:
+    4 GiB  registered in 0.7 s   11.67 GB/s
+    8 GiB  registered in 1.2 s   10.89 GB/s
+   12 GiB  registered in 1.7 s    9.60 GB/s
+   14 GiB  registered in 1.9 s    8.32 GB/s      (14 GiB is the ceiling, as for cudaHostAlloc)
+against a 12.8 GB/s link ceiling. So the slabs can be uploaded in place.
+
+bench/mkhot.py writes the top N GiB of experts, ranked by the undecayed counts in a v2 heat
+file, into one file plus an index. LLAMA_MOE_STREAM_HOT=<path> maps it read-write, pages it
+in with the I/O threads, locks it, and the worker then uploads a hot slab straight from the
+mapping: no read, no staging, one DRAM pass, and a locked page can never fault to disk.
+
+TWO THINGS THAT MATTER AND ARE EASY TO GET WRONG
+ 1. The file must be DISJOINT from the VRAM cache. Built from rank 0 it is mostly a second
+    copy of what L1 already holds: 11.65 -> 12.16 (+4%). Built from rank 67 per layer
+    (= --moe-stream-cache slots) it is the tier behind L1: 11.82 -> 12.28/12.39.
+    mkhot.py takes the skip count as its 4th argument.
+ 2. The index MUST be keyed on the slab's source location (split index + byte offset), never
+    on (layer, weight position). llama.cpp registers a layer's streamed weights in model
+    builder order, and qwen4exp creates ffn_down_exps BEFORE gate/up. The first version
+    assumed gate/up/down, served the wrong tensor for every slab, measured 48.03 tok/s - the
+    no-I/O ceiling, because the corrupted routing collapsed onto a handful of experts - and
+    emitted "!!!!!!!!" for every prompt. bench/qual.py exists to catch exactly this: six
+    factual checks plus a diff against a control run. ALWAYS RUN IT BEFORE BELIEVING A NUMBER.
+
+Measured with the file in place (matched L1 states, cache 6, io 4, --poll 0):
+      read summed    289 -> 109 ms/tok   (-62%; 72% of slab reads become hot hits)
+      stall           67 -> 55 ms/tok
+      8-prompt bench 11.8 -> 12.7 tok/s
+      conversation   10.2/10.5 -> 10.6/10.8 median, FIRST turns 5.5/9.6 -> 12.6/14.1
+Sizing: 11 GiB is the sweet spot. 14 GiB gives +1% but takes 157 s to start and leaves the OS
+2.6 GiB of page cache. The file is locked RAM, so it is zero-sum with the page cache in
+capacity terms. It wins because a hot hit costs one DRAM pass instead of three.
+
+=== DECOUPLED, BATCHED UPLOADER (works exactly as designed, buys nothing) ===
+ggml_backend_tensor_set synchronizes the CUDA stream after every slab. Measured
+(scratchpad/h2d.cu) at 626 KiB transfers: sync-per-copy 10.2-10.9 GB/s, one sync per batch
+12.8 GB/s at every thread count. Added ggml_backend_cuda_h2d_async / _h2d_sync (exposed
+through the backend registry, since ggml-cuda is a separately loaded module) plus a dedicated
+uploader thread with a pinned staging pool; hot-file slabs skip staging entirely because they
+are already locked. LLAMA_MOE_STREAM_ASYNC_UP=1.
+      up summed 63.5 -> 29.6 ms/tok   (-53%, exactly as predicted)
+      stall     54.3 -> 53.6 ms/tok   (NOTHING)
+      tok/s     12.33 -> 12.44
+The uploads were already overlapping other workers' reads, so halving them bought nothing.
+Left in, default OFF. It also died once during a long interactive run, so do not turn it on
+without re-running bench/qual.py.
+
+=== MEASURED, NO EFFECT (session 3, all after the handle fix) ===
+  io threads 6/10/14/20                      10.2-10.3   FLAT
+  io threads 1 / 2 / 4                       5.94 / 8.78 / 11.90  -> saturates at 4
+  compute threads -t 1/2/3/4/6               10.4-10.7   FLAT (with -ngl 99 the only CPU
+                                             graph op is the remap itself)
+  EmptyWorkingSet after load                 10.21 vs 10.38 ctl   NULL
+  I/O worker THREAD_PRIORITY_ABOVE_NORMAL    10.30 vs 10.38 ctl   NULL
+  LLAMA_MOE_STREAM_ADMIT=2/3/5               9.97 vs 11.10 ctl    WORSE
+  LLAMA_MOE_STREAM_WARM_GB 10/16/22 with a 44 GiB-deep ranking and parallel warming
+                                             11.08 / 11.07 / 10.82 vs 11.10 ctl   NULL.
+                                             The page cache converges to the same ~16 GiB of
+                                             content whatever you seed it with. Warming is a
+                                             first-answer feature and nothing else.
+  --moe-stream-cache 2 / 4 / 8               fails / 9.80 / 3.85 (cliff) vs 6 = 10.91
+  -np 1 with cache 8 / 9                     3.78 / 3.52 - -np 1 does NOT move the cliff
+  LLAMA_MOE_STREAM_SPLIT_WEIGHTS=0           9.59-9.76 vs 10.90   WORSE
+  LLAMA_MOE_STREAM_PINNED=0                  11.13 vs 12.03       WORSE (pinned staging is
+                                             worth ~7% now that the reads are fast)
+  LLAMA_MOE_STREAM_RANDOM_ACCESS=0           8.15 vs 12.03        MUCH WORSE. This flag did
+                                             nothing before the handle fix and matters a lot now.
+  non-uniform per-layer slot allocation      68.45% -> 69.28% hit, -2.6% misses. NOT WORTH IT.
+  L1 policy: LRU 69.97% (live 70%), static top-67 by frequency 55.82%, hybrid pin 16/32/48/56
+    = 68.8/67.8/65.7/64.2, BELADY 82.59%. LRU IS OPTIMAL ONLINE HERE. Stop looking.
+  lossless compression of expert slabs       zlib-1 1.052 (BIGGER), zlib-6 0.990, lzma-1 0.995.
+                                             IQ quants are already at entropy. A compressed
+                                             host tier cannot exist. DEAD END.
+
+=== THE TWO NUMBERS THAT BOUND EVERYTHING (check these before any new idea) ===
+LLAMA_MOE_STREAM_NOWAIT=1 maps every requested expert onto slot (id % n_slots) and loads
+nothing. The output is garbage by construction; the point is the clock:
+      47.4 tok/s  =  21 ms per token of GPU compute + graph with the expert stall removed.
+So of an ~80 ms token, 21 ms is compute and ~59 ms is expert I/O, and 47 tok/s is the ceiling
+that no amount of I/O work could ever pass.
+Second bound: 267 MiB of expert weight crosses PCIe every token at the measured 70% L1 hit
+rate. Gen3 x16 tops out at 12.8 GB/s (scratchpad/h2d.cu), so 21 ms of that 59 is pure link
+time. It cannot be removed without a higher L1 hit rate, which needs VRAM this card does not
+have: cache 8 GiB falls off the driver's spill cliff to 3.85 tok/s.
+
+=== RAM SENSITIVITY, MEASURED (bench/ramslope.py + bench/hog.py) ===
+Holding N GiB of touched private memory to shrink the page cache:
+      0 GiB   standby 15.3  disk  70.0 MiB/tok   10.79 tok/s
+      2 GiB   standby 12.0  disk  92.2 MiB/tok    9.87
+      4 GiB   standby  9.6  disk 107.9 MiB/tok    9.80
+      6 GiB   standby  7.5  disk 129.7 MiB/tok    8.80
+=> about 0.17 tok/s per GiB of page cache. This is the number that says chasing RAM is worth
+far less than it looks: recovering the entire ~8 GiB the GPU driver's WDDM backing holds
+would be worth about 1.4 tok/s. More RAM is NOT the big lever it is usually assumed to be
+on this workload, because the marginal experts it buys are cold ones.
+
+=== CORRECTION: THE FIRST HOT FILE WAS BUILT ON THE BENCHMARK PROMPTS ===
+The numbers in the hot-file section above (12.7 warm, 11.88/12.00 cold) are INFLATED. Here
+is how, because the mechanism will catch anyone who repeats this:
+
+llama-moe-stream checkpoints the expert ranking to LLAMA_MOE_STREAM_HEAT every ~256 tokens
+while it runs. bench/heatgen.py had written bench/expert2.heat at 15:05 from its own 24
+training prompts; the residency sweep (cfg_res.json, 15:09) then ran four configs that set
+LLAMA_MOE_STREAM_HEAT to that same file while generating on the eight MEASUREMENT prompts,
+and the server rewrote it - mtime 15:20:16. bench/mkhot.py built the hot file from it at
+17:52. So the ranking had seen the test set.
+
+The two prompt sets never overlapped (zero exact matches, max word-jaccard 0.25). The leak
+was entirely through the file.
+
+HOW BIG IT WAS. Rebuilt the ranking from the training prompts only (bench/expert_train.heat)
+and rebuilt the file:
+    contaminated file  17832 slabs
+    clean file         17829 slabs
+    shared             12174   = 68.3% of the clean file
+    only in the dirty one 5658 <- slabs the measured prompts put there, i.e. 32% of it
+
+Re-measured, same protocol, cold, interleaved, 4 generations each:
+                              contaminated     clean
+    cold shipping             11.88 / 12.00    11.55 / 11.57
+    warm 8-prompt sweep       12.7             11.43 / 11.58
+    conversation median       10.59 / 10.76    10.30
+    conversation first turns  12.6 / 14.1      12.1 / 13.4
+=> contamination was worth about +3% cold and +9% warm. It did NOT account for the result,
+which is the useful part: the hot file generalises - built on 24 unrelated prompts it still
+doubles the first two turns of a conversation about B-trees, a topic in neither set.
+
+THE CLEAN NUMBERS, which are the ones to quote:
+    as inherited (one shared handle, 9 io threads, poll 50, no hot file)   5.85 - 7.07
+    shipping (per-worker handles, io 4, --poll 0, 11 GiB clean hot file)   11.55 - 11.58
+    warm, no hot file 10.55  ->  with hot file 11.43 / 11.58               (+9%)
+    conversation, no hot file median 9.46 -> with 10.30, first turns
+        6.0 / 7.9 -> 12.1 / 13.4                                          (~2x)
+
+GUARDS NOW IN PLACE so this cannot recur:
+ - bench/heatgen.py writes bench/expert_train.heat, a path no benchmark config uses.
+ - bench/sweep.py raises if a config sets LLAMA_MOE_STREAM_HEAT at all. A measurement is
+   never allowed to write the ranking it will later be scored against.
+ - the contaminated experts.hot was deleted rather than kept around.
+NOTE the same trap applies to the shipped launcher: run-full177b.bat points HEAT at
+kvcache/expert.heat, which is correct for real use (the ranking should track YOUR usage),
+but never build a hot file from kvcache/expert.heat and then benchmark on prompts you have
+already run through that server.
+
+VARIANCE WARNING: the inherited arm measured 6.95/7.36 in one batch and 7.07/5.85 in
+another, and a warm no-hot arm once came in at 7.37 against 10.55 for the same config with a
+93 s load time. This box gets noisy when the page cache is churning. Interleave the arms,
+run at least two of each, and distrust any single config.

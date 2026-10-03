@@ -1,0 +1,26 @@
+[
+ {
+  "name": "J_ctl",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "J_hot",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "J_hot2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "J_ctl2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ }
+]

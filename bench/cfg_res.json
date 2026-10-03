@@ -1,0 +1,48 @@
+[
+ {
+  "name": "r_base",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "r_ad2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_ADMIT": "2:4294967295"
+  }
+ },
+ {
+  "name": "r_w10",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HEAT": "${ROOT}\\bench\\expert2.heat",
+   "LLAMA_MOE_STREAM_WARM_GB": "10"
+  }
+ },
+ {
+  "name": "r_w16",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HEAT": "${ROOT}\\bench\\expert2.heat",
+   "LLAMA_MOE_STREAM_WARM_GB": "16"
+  }
+ },
+ {
+  "name": "r_w16_ad2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HEAT": "${ROOT}\\bench\\expert2.heat",
+   "LLAMA_MOE_STREAM_WARM_GB": "16",
+   "LLAMA_MOE_STREAM_ADMIT": "2:4294967295"
+  }
+ },
+ {
+  "name": "r_w22_ad2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HEAT": "${ROOT}\\bench\\expert2.heat",
+   "LLAMA_MOE_STREAM_WARM_GB": "22",
+   "LLAMA_MOE_STREAM_ADMIT": "2:4294967295"
+  }
+ }
+]

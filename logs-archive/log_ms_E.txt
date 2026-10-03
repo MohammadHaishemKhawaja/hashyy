@@ -1,0 +1,14 @@
+0.00.041.399 I srv  llama_server: initializing ...
+0.00.041.413 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.041.707 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.051.989 I srv    load_model: loading model 'C:/Users/idont/Downloads/4/models/flashnext/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+0.00.860.935 W llama_model_load: disabling mmap because MoE expert streaming is enabled
+0.01.337.438 W load_tensors: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors
+0.03.531.700 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 26538.83 MiB on device 0: cudaMalloc failed: out of memory
+0.03.531.708 E alloc_tensor_range: failed to allocate CUDA0 buffer of size 27827980288
+0.03.675.588 E llama_model_load: error loading model: unable to allocate CUDA0 buffer for MoE expert streaming
+0.03.675.597 E llama_model_load_from_file_impl: failed to load model
+0.03.675.607 E cmn  common_init_: failed to load model 'C:/Users/idont/Downloads/4/models/flashnext/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+0.03.675.610 E srv    load_model: failed to load model, 'C:/Users/idont/Downloads/4/models/flashnext/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+0.03.675.618 I srv   operator (): operator (): cleaning up before exit...
+0.03.676.933 E srv  llama_server: exiting due to model loading error

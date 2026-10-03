@@ -1,0 +1,5 @@
+0.00.003.053 W DEPRECATED: argument '--lazy-mode' specified multiple times, use comma-separated values instead (only last value will be used)
+0.00.003.218 I srv  llama_server: initializing ...
+0.00.175.917 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.176.224 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.188.463 I srv    load_model: loading model 'C:\Users\idont\Downloads\4\models\flashnext\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'

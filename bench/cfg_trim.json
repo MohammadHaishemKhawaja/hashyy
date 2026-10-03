@@ -1,0 +1,34 @@
+[
+ {
+  "name": "t_ctl",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_TRIM": "0",
+   "LLAMA_MOE_STREAM_PRIO": "0"
+  }
+ },
+ {
+  "name": "t_trim",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_PRIO": "0"
+  }
+ },
+ {
+  "name": "t_prio",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_TRIM": "0"
+  }
+ },
+ {
+  "name": "t_both",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "t_both2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ }
+]

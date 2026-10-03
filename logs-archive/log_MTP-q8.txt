@@ -1,0 +1,16 @@
+0.00.003.382 I srv  llama_server: initializing ...
+0.00.114.288 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.114.599 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.120.906 I srv    load_model: loading model 'C:\Users\idont\Downloads\4\models\flashnext\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+0.01.354.542 E llama_model_load: error loading model: check_tensor_dims: tensor 'output_hc_norm.weight' not found
+0.01.354.555 E llama_model_load_from_file_impl: failed to load model
+0.01.357.658 W operator(): failed to measure the memory of the extra model, fitting without it: failed to load model
+0.06.572.862 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.12.711.671 I cmn          init: llama threadpool init, n_threads = 6
+0.14.593.419 I common_speculative_init_result: loading draft model 'C:\Users\idont\Downloads\4\models\flashnext\mtp-Qwen3.8-Flash-Next-Q8_0.gguf'
+0.15.118.443 E llama_model_load: error loading model: check_tensor_dims: tensor 'output_hc_norm.weight' not found
+0.15.118.451 E llama_model_load_from_file_impl: failed to load model
+0.15.118.453 E common_speculative_init_result: failed to load draft model, 'C:\Users\idont\Downloads\4\models\flashnext\mtp-Qwen3.8-Flash-Next-Q8_0.gguf'
+0.15.118.458 E srv    load_model: failed to load draft model, 'C:\Users\idont\Downloads\4\models\flashnext\mtp-Qwen3.8-Flash-Next-Q8_0.gguf'
+0.15.120.052 I srv    operator(): operator(): cleaning up before exit...
+0.15.141.193 E srv  llama_server: exiting due to model loading error

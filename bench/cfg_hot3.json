@@ -1,0 +1,30 @@
+[
+ {
+  "name": "K_hot",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}"
+  }
+ },
+ {
+  "name": "K_hot_as",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}",
+   "LLAMA_MOE_STREAM_ASYNC_UP": "1"
+  }
+ },
+ {
+  "name": "K_hot_as8",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 8 --poll 0",
+  "env": {
+   "LLAMA_MOE_STREAM_HOT": "${HOT}",
+   "LLAMA_MOE_STREAM_ASYNC_UP": "1"
+  }
+ },
+ {
+  "name": "K_ctl",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 4 --poll 0",
+  "env": {}
+ }
+]

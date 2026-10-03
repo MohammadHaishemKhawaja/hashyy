@@ -1,0 +1,27 @@
+[
+ {
+  "name": "th_t6",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0",
+  "env": {}
+ },
+ {
+  "name": "th_t1",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0 -t 1",
+  "env": {}
+ },
+ {
+  "name": "th_t2",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0 -t 2",
+  "env": {}
+ },
+ {
+  "name": "th_t3",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0 -t 3",
+  "env": {}
+ },
+ {
+  "name": "th_t4",
+  "args": "--moe-stream --moe-stream-cache 6 --moe-stream-io-threads 10 --poll 0 -t 4",
+  "env": {}
+ }
+]
