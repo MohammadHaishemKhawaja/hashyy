@@ -93,9 +93,25 @@ conversation, eight turns on one topic):
 | eight unrelated prompts in rotation — the pessimistic case | **11.43 – 11.58** |
 | cold start, same thing | 11.55 – 11.57 |
 | a fresh conversation, turn by turn | 9.1 → 13.4, median **10.30** |
-| **as inherited** (same binary, `LLAMA_MOE_STREAM_ONE_HANDLE=1`, no hot file) | 5.85 – 7.07 |
+| **baseline** — the code as this work started from (see below) | 5.85 – 7.07 |
 
 **~7.0 → 11.6 tok/s, +65%**, cold-started and interleaved against its own control.
+
+### What the baseline row means
+
+It is **not** stock llama.cpp. This project already had two rounds of work in it before the
+changes described here: the PR #25294 fork, a rewritten Windows read path, the persisted
+heat map, `--poll 0`. The baseline is *where this round started*, not zero.
+
+It is measured by running **the same binary** with `LLAMA_MOE_STREAM_ONE_HANDLE=1` (which
+puts the old single shared file handle back), 9 I/O threads, no `--poll 0`, no hot file and
+`-c 4096` — so the before/after is one binary, one machine, one afternoon, with the two arms
+interleaved. Comparing against a number from a different build on a different day is not
+worth much: the OS page cache alone drifts results 3-5%.
+
+If you have seen **8.14 tok/s** quoted for this project before, that was a *warm* run under
+the older, looser protocol. The 5.85-7.07 here is the same code measured **cold** with
+`bench/sweep.py --cold`. Cold-to-cold is the only comparison quoted in this file.
 
 Why "eight unrelated prompts" is the pessimistic case: every prompt drags a different set of
 experts through the cache, so the cache is never allowed to settle. A real session stays on
