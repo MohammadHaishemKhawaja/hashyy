@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "report_kind": "community_field_report",
+  "contributor": "ddonofrio",
+  "observed_date": "2026-11-04",
+  "timezone": "Europe/Madrid",
+  "provenance": {
+    "configuration": "Local launcher, CMake cache, source checkout, file metadata, Windows CIM and nvidia-smi inspection.",
+    "observations": "Transcribed from setup-session tool output and the operator's report; not an exported raw server log.",
+    "limitations": [
+      "Private interactive workload; no fixed prompt set, repeated trials or quality gate.",
+      "OS page cache was not flushed; persisted private heat ranking and hot file were enabled.",
+      "80K is configured context capacity, not a measured 80K-token input.",
+      "Final request timings and API usage were not retained.",
+      "Earlier 32K-context / 6 GiB expert-cache timings are excluded."
+    ]
+  },
+  "hardware": {
+    "cpu": {
+      "name": "Intel(R) Core(TM) Ultra 7 265HX",
+      "physical_cores": 20,
+      "logical_processors": 20
+    },
+    "ram": {
+      "installed_bytes": 34359738368,
+      "module_count": 2,
+      "module_capacity_bytes": 17179869184,
+      "type": "DDR5",
+      "configured_speed_mt_s": 6400,
+      "module_part_number": "M435R2GA3PB1-CCPRC"
+    },
+    "gpu": {
+      "name": "NVIDIA RTX PRO 3000 Blackwell Generation Laptop GPU",
+      "memory_total_mib": 12227
+    },
+    "storage": {
+      "model": "NVMe PC811 SED SK hynix 1024GB",
+      "advertised_capacity_gb": 1024,
+      "interface": "NVMe",
+      "filesystem": "NTFS",
+      "role": "System drive and model storage"
+    },
+    "operating_system": {
+      "name": "Microsoft Windows 11 Pro",
+      "version": "10.0.26300",
+      "build": "26300"
+    },
+    "nvidia_driver": "596.53",
+    "memory_snapshot": {
+      "gpu_used_mib": 11371,
+      "system_available_gib_approx": 1.64,
+      "scope": "Point-in-time readings during use, not peak measurements."
+    },
+    "gpu_power_and_clocks": "Not recorded"
+  },
+  "model": {
+    "name": "Qwen3.8-Flash-Next",
+    "parameter_count_label": "177B",
+    "quantization": "UD-IQ3_XXS",
+    "pruned": false,
+    "repository": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF",
+    "total_file_bytes": 81961823936,
+    "checksum_provenance": "Expected download sizes and SHA-256 values from scripts/dl_full.sh; not rehashed during this documentation update.",
+    "files": [
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf",
+        "bytes": 10946624,
+        "sha256": "268f81fdedf3149a538f252308927a4d5d1f6e062c178568a51e3b519744f8a8"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf",
+        "bytes": 49567921344,
+        "sha256": "cfe600b236b88c7fad1613a5ca5e83b9f2beb63cbd44c32b2be50a44747c695f"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf",
+        "bytes": 32382955968,
+        "sha256": "f1912ba34c79427d2295a58dcb2b732b5931af5bef7a373c60557a57d9ee7250"
+      }
+    ]
+  },
+  "build": {
+    "reproduction_base": "6fdd0ac8907fd973a42b876357823ad2124cd8ed",
+    "source_repository": "https://github.com/ggml-org/llama.cpp",
+    "combined_patch": {
+      "url": "https://github.com/ddonofrio/hashyy/blob/81853942b99b0ef1bc04add78e02fea62900cfb4/patches/0001-moe-stream-local-fixes.patch",
+      "sha256": "c51b31e3ee2e6df26a123a0aa995d0b87439d8c87eb38352ecad127b27bfee94",
+      "contents": "MoE streaming PR #25294, Qwen3.8 support PR #27742 and local Windows adaptations."
+    },
+    "local_checkout_head": "73dde8a4d50e19241646176ecaac6109270cd4a7",
+    "local_checkout_note": "Includes uncommitted local fixes. Reproduce using reproduction_base plus combined_patch; HEAD alone is insufficient.",
+    "cuda": "13.2.86",
+    "msvc": "19.51.36252.0",
+    "cmake": "4.4.3",
+    "ninja": "1.13.2",
+    "generator": "Ninja",
+    "cmake_settings": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120",
+      "GGML_CUDA": "ON",
+      "GGML_CUDA_FA_ALL_QUANTS": "OFF",
+      "GGML_NATIVE": "ON",
+      "LLAMA_CURL": "OFF",
+      "LLAMA_BUILD_TESTS": "OFF",
+      "LLAMA_BUILD_EXAMPLES": "OFF"
+    },
+    "binary_sha256": {
+      "llama-server.exe": "63673c33a57ce74243c3f8589259121b48bb79d58bf08de8b534766c76dc54e9",
+      "ggml-cuda.dll": "ca66fb380a823f0bdf852057983bf6f7a144a9fe650ad1657c58d2666a5792b9",
+      "llama.dll": "31b21d114d49125ccf2aa0766c948f760562061cd46c26d68c8c3521d11ad5e3",
+      "llama-server-impl.dll": "7f3e197e2a515972c47f6ecefc0ced87411d8c845a5e884f898a5253e97662ed"
+    },
+    "binary_hash_note": "Identifies the installed build; does not assert bit-reproducible compilation."
+  },
+  "launch": {
+    "path_base": "Repository root; Windows launcher expands paths relative to its own directory.",
+    "executable": "src/lcpp/build-ms/bin/llama-server.exe",
+    "environment": {
+      "CUDA_PATH": "build-tools/cuda/_root",
+      "PATH_prefix": [
+        "build-tools/cuda/_root/bin/x64",
+        "build-tools/cuda/_root/bin"
+      ],
+      "CUDA_VISIBLE_DEVICES": "0",
+      "LLAMA_MOE_STREAM_KEEP_MMAP": "1",
+      "LLAMA_MOE_STREAM_HOT": "models/flashnext/experts.hot",
+      "LLAMA_MOE_STREAM_HEAT": "kvcache/expert.heat"
+    },
+    "arguments": [
+      "-m",
+      "models/flashnext/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf",
+      "--moe-stream",
+      "--moe-stream-cache",
+      "5",
+      "--moe-stream-io-threads",
+      "4",
+      "--poll",
+      "0",
+      "-ngl",
+      "99",
+      "-fa",
+      "on",
+      "-ctk",
+      "q8_0",
+      "-ctv",
+      "q8_0",
+      "-ub",
+      "256",
+      "-c",
+      "80000",
+      "-np",
+      "1",
+      "--slot-save-path",
+      "kvcache",
+      "--jinja",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080"
+    ],
+    "observed_context_slot_tokens": 80128,
+    "expert_slots_per_layer": 56,
+    "expert_layers": 48,
+    "total_expert_slots": 2688,
+    "expert_tensor_gib_approx": 4.953,
+    "thinking": "Enabled by chat template default",
+    "reasoning_preserve_explicitly_enabled": false,
+    "speculative_decoding": false,
+    "kv_persistence": "Explicit slot save/restore; not automatic merely because slot-save-path is set."
+  },
+  "hot_file": {
+    "build_command": "python bench\\mkhot.py kvcache\\expert.heat models\\flashnext\\experts.hot 11 56",
+    "budget_gib": 11,
+    "skip_top_experts_per_layer": 56,
+    "size_bytes": 11810902016,
+    "selected_experts": 5941,
+    "tensor_slabs": 17823,
+    "index_header": "moe_hot 2 17823",
+    "index_size_bytes": 585041,
+    "index_sha256": "51da8a8e6d32049738347a7f910368fb3599d3304f6dc2c880a617d5edbacc0c",
+    "provenance": "Owner's private accumulated usage. Heat ranking remains mutable; hot file is a fixed selection until rebuilt.",
+    "distributed": false
+  },
+  "observations": {
+    "first_long_request": {
+      "scope": "First long request after startup, described as cold by the operator. Not a verified cold OS/weight cache.",
+      "prompt_processing_tokens_per_second_approx": 32,
+      "rate_source": "Operator-reported average during prefill; no final timing log retained.",
+      "full_prompt_tokens": null,
+      "generation_tokens_per_second": null,
+      "prefill_snapshot": {
+        "time": "2026-11-04T19:58:06+01:00",
+        "slot_context_tokens": 80128,
+        "prompt_array_size": 22528,
+        "newly_processed_tokens": 14336,
+        "cached_prefix_tokens": 6144,
+        "decoded_tokens": 0,
+        "note": "During prefill, array size may include a pending batch; it is not a final input token count."
+      },
+      "physical_disk_samples": [
+        {
+          "time": "2026-11-04T19:58:59+01:00",
+          "read_bytes_per_second": 2830452145,
+          "reads_per_second": 8554
+        },
+        {
+          "time": "2026-11-04T19:59:03+01:00",
+          "read_bytes_per_second": 3359176492,
+          "reads_per_second": 9997
+        },
+        {
+          "time": "2026-11-04T19:59:06+01:00",
+          "read_bytes_per_second": 3012434876,
+          "reads_per_second": 8770
+        }
+      ],
+      "physical_disk_counter_scope": "Windows physical-disk performance counters for the system/model drive; includes other processes."
+    },
+    "warm_follow_up": {
+      "input_tokens": 31767,
+      "cached_prefix_tokens": 30618,
+      "newly_processed_tokens": 1149,
+      "cached_fraction_percent_rounded": 96.4,
+      "prompt_processing_tokens_per_second": null,
+      "sampling_parameters": {
+        "temperature": 1,
+        "top_k": 20,
+        "top_p_approx": 0.95,
+        "min_p_approx": 0.05,
+        "seed_reported": 4294967295,
+        "seed_note": "Default/random sentinel, not a fixed experimental seed",
+        "max_tokens": 32000,
+        "stream": true,
+        "reasoning_format": "deepseek"
+      },
+      "live_samples": [
+        {
+          "time": "2026-11-04T20:05:02+01:00",
+          "decoded_tokens": 1208,
+          "prompt_array_size": 32975,
+          "process_read_mib_per_second_rounded": 2391
+        },
+        {
+          "time": "2026-11-04T20:05:05+01:00",
+          "decoded_tokens": 1263,
+          "prompt_array_size": 33030,
+          "process_read_mib_per_second_rounded": 2263
+        },
+        {
+          "time": "2026-11-04T20:05:09+01:00",
+          "decoded_tokens": 1307,
+          "prompt_array_size": 33074,
+          "process_read_mib_per_second_rounded": 2212
+        },
+        {
+          "time": "2026-11-04T20:05:12+01:00",
+          "decoded_tokens": 1352,
+          "prompt_array_size": 33119,
+          "process_read_mib_per_second_rounded": 2325
+        }
+      ],
+      "sample_generation_tokens_per_second_approx": 14.4,
+      "sample_calculation": "(1352 - 1208) / approximately 10 seconds",
+      "timing_precision": "Whole-second local timestamps; API and Windows reads were sequential, so the interval and rate are approximate.",
+      "process_read_counter_scope": "Process I/O read accounting, including cache-served reads; not comparable to the physical-disk samples above.",
+      "completed": true,
+      "completion_evidence": "Slot later returned to idle with prompt array size 33861.",
+      "final_usage_and_timing_log_retained": false,
+      "complete_generation_tokens": null,
+      "complete_generation_duration_seconds": null,
+      "complete_generation_tokens_per_second": null,
+      "time_to_first_token_seconds": null
+    }
+  }
+}
