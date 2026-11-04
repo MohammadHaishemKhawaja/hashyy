@@ -775,3 +775,9 @@ Ranked by measured value per pound:
 
 Raw data: [`alreadyTried`](alreadyTried) · [`bench/FINDINGS.md`](bench/FINDINGS.md) ·
 [`RESULTS.md`](RESULTS.md) · [`bench/results.jsonl`](bench/results.jsonl)
+
+## Community reports
+
+Reports from other systems document their own configuration and measurement methods:
+
+- [RTX PRO 3000 Blackwell Laptop GPU with 80K context](bench/community/rtx-pro-3000-laptop-80k.md) — hardware, a working configuration, and observations from interactive use.
